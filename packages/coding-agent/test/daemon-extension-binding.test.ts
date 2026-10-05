@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
@@ -12,10 +13,14 @@ import {
 import { AuthStorage } from "../src/core/auth-storage.js";
 
 import { SessionManager } from "../src/core/session-manager.js";
-import type { ExtensionAPI, ExtensionFactory } from "../src/index.js";
+import type { ExtensionAPI, ExtensionFactory, ExtensionUIContext } from "../src/index.js";
 
-import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
+import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { bindActiveSessionState } from "../src/modes/daemon/daemon-extension-binding.js";
+import {
+	setDaemonClientSessionCapabilities,
+	shouldSendDaemonOutboundToClient,
+} from "../src/modes/daemon/daemon-mode.js";
 import type { DaemonOutbound } from "../src/modes/daemon/daemon-protocol.js";
 
 describe("daemon extension binding", () => {
@@ -98,6 +103,101 @@ describe("daemon extension binding", () => {
 
 		return runtime;
 	}
+
+	it.each(["parent", "headless-child", "legacy"])(
+		"only waits for dialogs when the %s session has a UI recipient",
+		async (activeSessionId) => {
+			let ui: ExtensionUIContext | undefined;
+			const runtime = await createRuntimeForTest((pi) => {
+				pi.on("session_start", (_event, ctx) => {
+					ui = ctx.ui;
+				});
+			}, []);
+			const socket = new Socket();
+			cleanups.push(() => {
+				socket.destroy();
+			});
+			const client: DaemonSocketClient = {
+				id: "multiplexed-client",
+				socket,
+				detachInput: () => {},
+				attachedActiveSessionIds: new Set(["parent", "headless-child", "legacy"]),
+				capabilities: new Set(["extension_ui"]),
+				supportsExtensionUi: true,
+			};
+			setDaemonClientSessionCapabilities(client, "parent", new Set(["extension_ui"]));
+			setDaemonClientSessionCapabilities(client, "headless-child", new Set());
+			const state: ActiveSessionState = {
+				activeSessionId,
+				runtime,
+				clients: new Set([client]),
+				pendingAttaches: 0,
+				extensionUiRequests: new Map(),
+				eventGeneration: "dialogs",
+				lastEventSequence: 0,
+			};
+			const delivered: DaemonOutbound[] = [];
+			await bindActiveSessionState(state, {
+				broadcast: (_state, message) => {
+					if (shouldSendDaemonOutboundToClient(client, message)) delivered.push(message);
+				},
+				shutdown: () => {},
+			});
+			if (!ui) throw new Error("Extension UI was not bound");
+			const dialogs = [
+				{
+					method: "select",
+					result: ui.select("Choose", ["selected"]),
+					fallback: undefined,
+					response: { value: "selected" },
+					expected: "selected",
+				},
+				{
+					method: "confirm",
+					result: ui.confirm("Approval", "Allow?"),
+					fallback: false,
+					response: { confirmed: true },
+					expected: true,
+				},
+				{
+					method: "input",
+					result: ui.input("Input"),
+					fallback: undefined,
+					response: { value: "typed" },
+					expected: "typed",
+				},
+				{
+					method: "editor",
+					result: ui.editor("Editor"),
+					fallback: undefined,
+					response: { value: "edited" },
+					expected: "edited",
+				},
+			];
+			try {
+				if (activeSessionId === "headless-child") {
+					expect(delivered.filter((message) => message.type === "extension_ui_request")).toEqual([]);
+					expect(state.extensionUiRequests.size).toBe(0);
+					for (const dialog of dialogs) await expect(dialog.result).resolves.toBe(dialog.fallback);
+				} else {
+					for (const dialog of dialogs) {
+						const request = delivered.find(
+							(message) => message.type === "extension_ui_request" && message.method === dialog.method,
+						);
+						if (!request || request.type !== "extension_ui_request") throw new Error("Dialog was not delivered");
+						const pending = state.extensionUiRequests.get(request.id);
+						if (!pending) throw new Error("Dialog did not wait for a response");
+						pending.resolve(dialog.response);
+						await expect(dialog.result).resolves.toBe(dialog.expected);
+					}
+				}
+				expect(state.extensionUiRequests.size).toBe(0);
+			} finally {
+				for (const pending of [...state.extensionUiRequests.values()]) pending.resolve({ cancelled: true });
+				await Promise.all(dialogs.map((dialog) => dialog.result));
+			}
+		},
+	);
 
 	it("strips the duplicated partial message from broadcast message_update events", async () => {
 		const runtime = await createRuntimeForTest(() => {}, ["streamed reply"]);

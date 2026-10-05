@@ -57,6 +57,11 @@ export interface DaemonSocketClient {
 	capabilitiesByActiveSessionId?: Map<string, Set<DaemonClientCapability>>;
 }
 
+// Admission and delivery must use the same session capability, not another session's UI.
+export function daemonClientSupportsExtensionUi(client: DaemonSocketClient, activeSessionId: string): boolean {
+	return client.capabilitiesByActiveSessionId?.get(activeSessionId)?.has("extension_ui") ?? client.supportsExtensionUi;
+}
+
 export interface ActiveSessionState {
 	activeSessionId: string;
 	runtime: AgentSessionRuntime;

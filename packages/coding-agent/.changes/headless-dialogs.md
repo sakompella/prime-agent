@@ -1,0 +1,1 @@
+- Fixed headless child dialogs waiting for UI clients attached only to another session.

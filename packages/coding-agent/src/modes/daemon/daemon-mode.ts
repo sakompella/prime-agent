@@ -136,6 +136,7 @@ import {
 	AmbiguousActiveSessionError,
 	createActiveSessionId,
 	type DaemonSocketClient,
+	daemonClientSupportsExtensionUi,
 	resolveActiveSessionState,
 } from "./active-session-state.js";
 import {
@@ -7980,10 +7981,6 @@ function daemonClientCapabilitiesForSession(
 	activeSessionId: string,
 ): ReadonlySet<DaemonClientCapability> {
 	return client.capabilitiesByActiveSessionId?.get(activeSessionId) ?? client.capabilities;
-}
-
-function daemonClientSupportsExtensionUi(client: DaemonSocketClient, activeSessionId: string): boolean {
-	return client.capabilitiesByActiveSessionId?.get(activeSessionId)?.has("extension_ui") ?? client.supportsExtensionUi;
 }
 
 export function markClientSnapshotStreaming(client: DaemonSocketClient, activeSessionId: string): AbortSignal {

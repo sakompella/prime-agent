@@ -10,7 +10,7 @@ import type { SubagentRuntimeHost } from "../../core/rlm-runtime.js";
 import { createAgentConnectionState } from "../agent-connection/snapshot.js";
 import type { AgentConnectionState } from "../agent-connection/types.js";
 import { type Theme, theme } from "../interactive/theme/theme.js";
-import type { ActiveSessionState } from "./active-session-state.js";
+import { type ActiveSessionState, daemonClientSupportsExtensionUi } from "./active-session-state.js";
 import { execEnvForSession, withClientEnv } from "./daemon-client-env.js";
 import {
 	type DaemonExtensionUIResponse,
@@ -253,5 +253,5 @@ function hasExtensionUiClientForMethod(state: ActiveSessionState, method: string
 	if (!isDaemonDialogExtensionUiRequest(method)) {
 		return state.clients.size > 0;
 	}
-	return [...state.clients].some((client) => client.supportsExtensionUi);
+	return [...state.clients].some((client) => daemonClientSupportsExtensionUi(client, state.activeSessionId));
 }
