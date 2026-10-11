@@ -146,9 +146,10 @@ fn rpc_steer_and_follow_up_queue_then_abort() {
         json!(["steer this"]),
         "the queue projection carries the queued previews: {state}"
     );
-    let aborted = client.request(&json!({ "type": "abort" }));
-    assert_eq!(aborted["success"], true);
-    client.wait_event("agent_end");
+    let (aborted, _) = client.request_and_wait(&json!({ "type": "abort" }), |frame| {
+        frame["type"] == "agent_end"
+    });
+    assert_eq!(aborted["success"], true, "{aborted}");
 }
 
 #[test]
@@ -616,10 +617,17 @@ fn rpc_failed_switch_keeps_the_session_and_its_queue() {
         ),
     )
     .expect("write the crafted session");
-    let failed = client.request(&json!({
-        "type": "switch_session",
-        "sessionPath": bad_file.to_string_lossy(),
-    }));
+    let (failed, _) = client.request_and_wait(
+        &json!({
+            "type": "switch_session",
+            "sessionPath": bad_file.to_string_lossy(),
+        }),
+        |frame| {
+            frame["type"] == "message_end"
+                && frame["message"]["role"] == "assistant"
+                && first_text(&frame["message"]) == "steer answer"
+        },
+    );
     assert_eq!(failed["success"], false, "{failed}");
     assert!(
         failed["error"]
@@ -628,9 +636,4 @@ fn rpc_failed_switch_keeps_the_session_and_its_queue() {
             .contains("Stored session working directory does not exist"),
         "the failure is the crafted stale cwd, not an unrelated refusal: {failed}"
     );
-    client.wait_frame(|frame| {
-        frame["type"] == "message_end"
-            && frame["message"]["role"] == "assistant"
-            && first_text(&frame["message"]) == "steer answer"
-    });
 }
