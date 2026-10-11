@@ -335,6 +335,49 @@ fn rpc_session_kernel_sees_only_its_clients_t3_env() {
     );
 }
 
+/// An RLM child is a worker of its own: its kernel must see its parent's
+/// `T3_*` env, not the supervisor's.
+#[test]
+fn rpc_spawned_child_kernel_sees_its_parents_t3_env() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let mut starter =
+        RpcChild::spawn_configured(&["--mode", "rpc"], &t3_probe_script(), |_, command| {
+            command.env("T3_PROBE", "stale");
+        });
+    let state = starter.request(&json!({ "type": "get_state" }));
+    assert_eq!(state["success"], true, "the daemon is up: {state}");
+    let child_script = json!({ "engine": "faux", "responses": [
+        ipython_call(
+            "import os\nawait agent_message.send(repr(os.environ.get('T3_PROBE')), receiver_role='parent')",
+        ),
+        { "text": "kid done" },
+    ] });
+    let mut parent = starter.join(
+        "parent-script.json",
+        &["--mode", "rpc"],
+        &spawn_parent_script(&["parent woke", "parent woke again"]),
+        |home, command| {
+            let child_script_path = home.join("child-script.json");
+            std::fs::write(&child_script_path, child_script.to_string()).unwrap();
+            command
+                .env("PRIME_AGENT_FAUX_CHILD_SCRIPT", &child_script_path)
+                .env("PRIME_AGENT_KERNEL_PYTHON", &kernel_python)
+                .env("T3_PROBE", "fresh");
+        },
+    );
+    let response = parent.request(&json!({ "type": "prompt", "message": "spawn the kid" }));
+    assert_eq!(response["success"], true, "{response}");
+    let (delivered, _) = parent.wait_frame(|frame| {
+        frame["type"] == "message_start" && frame["message"]["customType"] == "agent_message"
+    });
+    assert_eq!(
+        delivered["message"]["details"]["message"], "'fresh'",
+        "{delivered}"
+    );
+}
+
 /// A faux reply that streams for far longer than the lifecycle tests wait.
 fn slow_stream_script() -> Value {
     json!({
