@@ -90,20 +90,8 @@ fn run_acp_mode(options: &RunOptions) -> Result<i32, String> {
 }
 
 async fn acp_mode_main(options: &RunOptions) -> Result<i32, String> {
-    // The disclosure prints on the ACP client's stderr before any
-    // transport starts (TS pushes the daemon-created session's diagnostics
-    // to the client; the Rust stderr surface prints it here).
-    crate::telemetry_notice::print_if_due(&options.config);
-    // Flag > env > default: the same `PRIME_AGENT_DAEMON_SOCKET` contract
-    // as every other mode (the `prime-agent` launcher written by
-    // install-rust.sh pins that env, so the ACP path must honor it or it
-    // would target the TypeScript default socket and treat the schema
-    // mismatch as a stale daemon).
-    let socket_path = crate::config::resolve_daemon_socket_path(options.daemon_socket.as_deref());
-    crate::interactive_mode::ensure_daemon_running(&socket_path, &options.config.cwd)
-        .await
-        .map_err(|error| format!("{error:#}"))?;
-    let (actual_cwd, create) = daemon_acp_create(options)?;
+    let socket_path = ensure_headless_daemon(options).await?;
+    let (actual_cwd, create) = daemon_session_create(options, DaemonClientMode::Acp)?;
     pa_daemon::acp::daemon::run_daemon_attached_acp_mode(pa_daemon::acp::daemon::DaemonAcpOptions {
         socket_path,
         actual_cwd,
@@ -114,24 +102,67 @@ async fn acp_mode_main(options: &RunOptions) -> Result<i32, String> {
     .map_err(|error| format!("{error:#}"))
 }
 
-/// The ACP daemon session's create (TS main.ts `defaultSessionConfig` +
-/// the startup create): the session the flags select, client-owned only
-/// for `--no-session`, plus the session's cwd. The worker opens and
-/// leases the selected file itself.
-fn daemon_acp_create(
+/// The daemon-backed headless modes' startup: disclose telemetry, then
+/// make sure a supervisor listens on the resolved socket (spawning one
+/// detached). Returns the socket.
+async fn ensure_headless_daemon(options: &RunOptions) -> Result<std::path::PathBuf, String> {
+    // The disclosure prints on the client's stderr before any transport
+    // starts (TS pushes the daemon-created session's diagnostics to the
+    // client; the Rust stderr surface prints it here).
+    crate::telemetry_notice::print_if_due(&options.config);
+    // Flag > env > default: the same `PRIME_AGENT_DAEMON_SOCKET` contract
+    // as every other mode (the `prime-agent` launcher written by
+    // install-rust.sh pins that env, so the headless paths must honor it or
+    // they would target the TypeScript default socket and treat the schema
+    // mismatch as a stale daemon).
+    let socket_path = crate::config::resolve_daemon_socket_path(options.daemon_socket.as_deref());
+    crate::interactive_mode::ensure_daemon_running(&socket_path, &options.config.cwd)
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    Ok(socket_path)
+}
+
+/// The stdio surface a daemon-backed headless mode serves.
+#[derive(Debug, Clone, Copy)]
+enum DaemonClientMode {
+    Acp,
+    Rpc,
+}
+
+impl DaemonClientMode {
+    /// The telemetry execution mode (TS main.ts `executionMode: appMode`).
+    fn execution_mode(self) -> &'static str {
+        match self {
+            DaemonClientMode::Acp => "acp",
+            DaemonClientMode::Rpc => "rpc",
+        }
+    }
+
+    /// TS `isClientOwnedDaemonSession`: every mode but ACP owns its
+    /// session, and ACP owns only a `--no-session` one; an owned session
+    /// ends with the connection.
+    fn lifecycle(self, no_session: bool) -> pa_types::daemon::DaemonSessionLifecycle {
+        use pa_types::daemon::DaemonSessionLifecycle;
+        match self {
+            DaemonClientMode::Acp if !no_session => DaemonSessionLifecycle::Resident,
+            DaemonClientMode::Acp | DaemonClientMode::Rpc => DaemonSessionLifecycle::ClientOwned,
+        }
+    }
+}
+
+/// The headless daemon session's create (TS main.ts `defaultSessionConfig`
+/// plus the startup create): the session the flags select and the
+/// session's cwd. The worker opens and leases the selected file itself.
+fn daemon_session_create(
     options: &RunOptions,
+    mode: DaemonClientMode,
 ) -> Result<(std::path::PathBuf, pa_types::daemon::DaemonCommand), String> {
-    use pa_types::daemon::DaemonSessionLifecycle;
     let config = &options.config;
     let session_dir = replacement_session_dir(options);
-    let (cwd, session_path, lifecycle) = if options.session.no_session {
-        (
-            config.cwd.clone(),
-            None,
-            DaemonSessionLifecycle::ClientOwned,
-        )
+    let (cwd, session_path) = if options.session.no_session {
+        (config.cwd.clone(), None)
     } else {
-        let (cwd, session_path) = match select_headless_session(options)? {
+        match select_headless_session(options)? {
             HeadlessSession::Fork(source) => {
                 let fork = pa_core::session::manager::SessionManager::fork_from(
                     &source,
@@ -148,16 +179,14 @@ fn daemon_acp_create(
                 Some(path),
             ),
             HeadlessSession::Fresh => (config.cwd.clone(), None),
-        };
-        (cwd, session_path, DaemonSessionLifecycle::Resident)
+        }
     };
     // The CLI session flags, under the TS `runtimeConfigFromArgs`
     // names. `--api-key` stays off: the create config is persisted.
     let mut create_config = serde_json::json!({
         "cwd": cwd.display().to_string(),
         "sessionDir": session_dir.display().to_string(),
-        // The telemetry execution mode (TS main.ts `executionMode: appMode`).
-        "executionMode": "acp",
+        "executionMode": mode.execution_mode(),
     });
     if let Some(provider) = &config.provider {
         create_config["provider"] = serde_json::json!(provider);
@@ -210,7 +239,7 @@ fn daemon_acp_create(
         config: Some(create_config),
         telemetry_disabled: crate::mode::create_telemetry_disabled(config),
         runtime_metadata: None,
-        lifecycle: Some(lifecycle),
+        lifecycle: Some(mode.lifecycle(options.session.no_session)),
         env: None,
         launch_env: None,
         rest: serde_json::Map::default(),
@@ -226,115 +255,18 @@ fn run_rpc_mode(options: &RunOptions) -> Result<i32, String> {
     rt.block_on(rpc_mode_main(options))
 }
 
+/// The RPC headless mode (TS main.ts, the daemon client runtime): the
+/// session lives in a daemon worker this client owns, and the RPC surface
+/// is served over it until stdin closes.
 async fn rpc_mode_main(options: &RunOptions) -> Result<i32, String> {
-    let config = &options.config;
-    let mut initial_lease = None;
-    let parts = build_headless_engine_parts(options, "rpc", &mut initial_lease).await?;
-    if let Some(goal) = &config.initial_goal {
-        parts
-            .engine
-            .seed_initial_goal(&goal.objective, goal.token_budget.map(u64::from))
-            .await
-            .map_err(|error| format!("{error:#}"))?;
-    }
-    let factory = rpc_engine_factory(options);
-    let mut engine_handle = pa_daemon::rpc::session::RpcEngineHandle::from(parts);
-    engine_handle.session_lease = initial_lease;
-    let exit_code = pa_daemon::rpc::run_rpc_mode(pa_daemon::rpc::RpcOptions {
-        engine: engine_handle,
-        engine_factory: Some(factory),
-        cwd: config.cwd.clone(),
-        agent_dir: config.agent_dir.clone(),
-        autonomous_config: options
-            .config
-            .autonomous
-            .as_ref()
-            .map(autonomous_runtime_config),
+    let socket_path = ensure_headless_daemon(options).await?;
+    let (_, create) = daemon_session_create(options, DaemonClientMode::Rpc)?;
+    pa_daemon::rpc::daemon::run_daemon_attached_rpc_mode(pa_daemon::rpc::daemon::DaemonRpcOptions {
+        socket_path,
+        create,
     })
     .await
-    .map_err(|error| format!("{error:#}"))?;
-    Ok(exit_code)
-}
-
-/// The engine-replacement seam the RPC mode's `new_session`/`switch_session`/
-/// `fork` commands drive: pa-cli owns the assembly, the mode owns the swap.
-fn rpc_engine_factory(options: &RunOptions) -> pa_daemon::rpc::session::RpcEngineFactory {
-    let options = options.clone();
-    std::sync::Arc::new(move |request| {
-        let mut options = options.clone();
-        // The replacement sessions ignore the CLI's session-selection flags.
-        options.session.resume = None;
-        options.session.resume_bare = false;
-        options.session.continue_recent = false;
-        options.session.fork = None;
-        Box::pin(async move {
-            let (manager, opened_lease) = match &request {
-                pa_daemon::rpc::session::RpcEngineRequest::New {
-                    parent_session,
-                    cwd,
-                } => {
-                    let session_dir = replacement_session_dir(&options);
-                    // The active session's cwd when the command passed one, else the CLI startup
-                    // directory.
-                    let cwd = cwd.clone().unwrap_or_else(|| options.config.cwd.clone());
-                    let manager = match parent_session {
-                        Some(parent) => {
-                            let mut manager = pa_core::session::manager::SessionManager::persisted(
-                                &cwd,
-                                &session_dir,
-                            );
-                            manager.new_session(&pa_core::session::manager::NewSessionOptions {
-                                parent_session: Some(parent.clone()),
-                                ..Default::default()
-                            });
-                            manager
-                        }
-                        None => {
-                            pa_core::session::manager::SessionManager::persisted(&cwd, &session_dir)
-                        }
-                    };
-                    // The fresh session's file is leased BEFORE the replacement can write it.
-                    let lease = pa_daemon::lease::acquire_runtime_session_lease(
-                        manager
-                            .get_session_file()
-                            .expect("a fresh session knows its file"),
-                        &options.config.agent_dir,
-                    )
-                    .map_err(|error| format!("{error:#}"))?;
-                    (manager, Some(lease))
-                }
-                pa_daemon::rpc::session::RpcEngineRequest::Open {
-                    session_path,
-                    reuse_lease,
-                } => {
-                    let session_dir = replacement_session_dir(&options);
-                    let cwd = options.config.cwd.clone();
-                    // A same-path reopen skips the guard (the session layer adopted it).
-                    let lease = if *reuse_lease {
-                        None
-                    } else {
-                        Some(session_open_guard(
-                            options.daemon_socket.as_deref(),
-                            session_path,
-                        )?)
-                    };
-                    let manager = open_session_file(session_path, &session_dir, &cwd, None)?;
-                    // The replacement ADOPTS the opened session's own cwd: tools,
-                    // settings, and file work run against the session's repository.
-                    options.config.cwd = manager.get_cwd().to_path_buf();
-                    (manager, lease)
-                }
-            };
-            let engine = if let Ok(script) = std::env::var("PRIME_AGENT_FAUX_SCRIPT") {
-                build_faux_engine_with(&options, &script, Some(manager), "rpc").await?
-            } else {
-                build_headless_engine_with(&options, Some(manager), "rpc").await?
-            };
-            let mut handle = pa_daemon::rpc::session::RpcEngineHandle::from(engine);
-            handle.session_lease = opened_lease;
-            Ok(handle)
-        })
-    })
+    .map_err(|error| format!("{error:#}"))
 }
 
 fn replacement_session_dir(options: &RunOptions) -> std::path::PathBuf {
@@ -343,18 +275,6 @@ fn replacement_session_dir(options: &RunOptions) -> std::path::PathBuf {
         .session_dir
         .clone()
         .unwrap_or_else(|| options.config.agent_dir.join("sessions"))
-}
-
-impl From<HeadlessEngine> for pa_daemon::rpc::session::RpcEngineHandle {
-    fn from(parts: HeadlessEngine) -> Self {
-        Self {
-            engine: std::sync::Arc::new(parts.engine),
-            model: parts.model,
-            api_key: parts.api_key,
-            provider_target: parts.provider_target,
-            session_lease: None,
-        }
-    }
 }
 
 fn run_print_mode(options: &RunOptions) -> Result<i32, String> {
@@ -411,8 +331,7 @@ async fn print_mode_main(
 /// seam (`PRIME_AGENT_FAUX_SCRIPT`) drives the same assembly without the
 /// network; verification harness only, never set by the product.
 ///
-/// The switchable provider target the session's stream reads per call
-/// (shared with the RPC mode, whose picker model switches swap it live).
+/// The switchable provider target the session's stream reads per call.
 pub type ProviderTargetSlot = std::sync::Arc<std::sync::RwLock<Option<ProviderTarget>>>;
 
 /// The assembled headless engine, so host transports can drive session-command
@@ -421,11 +340,6 @@ struct HeadlessEngine {
     engine: pa_core::session_engine::engine::SessionEngine,
     model: Model,
     api_key: Option<String>,
-    /// The live provider target: the stream reads it per call, and the
-    /// RPC mode's picker switches swap it (TS `setModel`'s stream
-    /// re-registration; `set_model` swaps it without rebuilding the
-    /// session).
-    provider_target: ProviderTargetSlot,
 }
 
 /// Transfer the opened lease to its mode before fallible engine assembly.
@@ -614,7 +528,6 @@ async fn build_headless_engine_with(
         engine,
         model,
         api_key: resolved.api_key,
-        provider_target,
     })
 }
 
@@ -1533,7 +1446,6 @@ async fn build_faux_engine_with(
         engine,
         model,
         api_key: None,
-        provider_target,
     })
 }
 

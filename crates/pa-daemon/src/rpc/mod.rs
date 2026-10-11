@@ -2,8 +2,11 @@
 //! responses and events on stdout; one connection drives one live session,
 //! stdin close settles the running turn, SIGTERM/SIGHUP exit 143/129; the
 //! in-process transport answers daemon-only surfaces with daemon-mode errors.
+//! `--mode rpc` serves the daemon-attached transport ([`daemon`]); the
+//! in-process runner below stays as the upstream library, unwired.
 
 pub mod commands;
+pub mod daemon;
 pub mod model_commands;
 pub mod prompt_commands;
 pub mod protocol;
