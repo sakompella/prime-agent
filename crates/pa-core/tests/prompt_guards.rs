@@ -299,7 +299,8 @@ fn all_string_literals(text: &str) -> Vec<String> {
 /// Kernel-bound REPL names from the real bootstrap code (`rlm`, `bash`,
 /// `mcp`), derived from `build_rlm_bootstrap_code`.
 fn kernel_bound_names() -> BTreeSet<String> {
-    let code = pa_core::kernel::bootstrap::build_rlm_bootstrap_code(&[], false);
+    let code =
+        pa_core::kernel::bootstrap::build_rlm_bootstrap_code(&[], false, pa_core::T3Code::Absent);
     let mut names = BTreeSet::new();
     for line in code.lines() {
         let line = line.trim_start();

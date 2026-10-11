@@ -121,6 +121,7 @@ fn assemble_breakdown(
             selected_tools: Some(vec![pa_types::ai::PYTHON_TOOL_NAME]),
             allow_recursion: Some(true),
             generic_mcp_servers: generic_servers,
+            t3_code: pa_core::T3Code::from_env(|key| std::env::var(key).ok()),
             rlm_depth: Some(0),
             model_prompt_extras: model_prompts.extras.as_deref(),
             ..Default::default()

@@ -3,6 +3,7 @@
 //! Python skill.
 
 use super::KernelPythonSkill;
+use crate::T3Code;
 
 /// Line the runtime bootstrap prints when one or more pre-imported Python skills failed to import.
 /// The host scans the bootstrap cell's stdout for this marker.
@@ -83,19 +84,44 @@ except Exception as _prime_agent_rlm_error:
         rlm._raise_missing()
 "#;
 
+/// Binds `t3` in T3 sessions. A failed import binds a stub that raises the import error, so the
+/// rest of the bootstrap still runs.
+const RLM_BOOTSTRAP_T3_CODE: &str = r#"
+try:
+    import rlm.t3 as t3
+except Exception as _prime_agent_t3_error:
+    _PRIME_AGENT_T3_IMPORT_ERROR = str(_prime_agent_t3_error) or type(_prime_agent_t3_error).__name__
+
+    class _PrimeAgentMissingT3:
+        def __getattr__(self, name):
+            if name.startswith("_"):
+                raise AttributeError(name)
+            raise RuntimeError(
+                "The t3 module failed to import in this kernel, so T3 Code's tools are unavailable. "
+                f"Import error: {_PRIME_AGENT_T3_IMPORT_ERROR}"
+            )
+
+    t3 = _PrimeAgentMissingT3()
+"#;
+
 /// The code the session injects right after kernel start/restore: binds the `rlm`, `bash`, and MCP
-/// surfaces, imports every Python skill. `bash_notices_wired` emits the bounded-await toggle only
-/// when the host registers the bash completion notice.
+/// surfaces (plus `t3` in T3 sessions), imports every Python skill. `bash_notices_wired` emits
+/// the bounded-await toggle only when the host registers the bash completion notice.
 #[must_use]
 pub fn build_rlm_bootstrap_code(
     python_skills: &[KernelPythonSkill],
     bash_notices_wired: bool,
+    t3_code: T3Code,
 ) -> String {
     let mut runtime_code = String::from(RLM_BOOTSTRAP_RUNTIME_HEAD_CODE);
     if bash_notices_wired {
         runtime_code.push_str(RLM_BOOTSTRAP_BASH_NOTICES_LINE_CODE);
     }
     runtime_code.push_str(RLM_BOOTSTRAP_RUNTIME_TAIL_CODE);
+    match t3_code {
+        T3Code::Absent => {}
+        T3Code::Present => runtime_code.push_str(RLM_BOOTSTRAP_T3_CODE),
+    }
     let base_code = format!("{RLM_BOOTSTRAP_HEADER_CODE}\n\n{runtime_code}");
     // TS: `[...new Set(pythonSkills.map(...))]` — first-seen order, so the pre-import loop follows
     // the session's skill discovery order.
@@ -196,7 +222,6 @@ if _PRIME_AGENT_SKILL_IMPORT_ERRORS:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::T3Code;
     use std::path::PathBuf;
 
     #[test]
@@ -208,8 +233,8 @@ mod tests {
 
     #[test]
     fn bootstrap_turns_the_bounded_bash_default_on_only_with_notices() {
-        let daemonless = build_rlm_bootstrap_code(&[], false);
-        let noticed = build_rlm_bootstrap_code(&[], true);
+        let daemonless = build_rlm_bootstrap_code(&[], false, T3Code::Absent);
+        let noticed = build_rlm_bootstrap_code(&[], true, T3Code::Absent);
         assert!(
             noticed.contains("_set_completion_notices_wired(True)"),
             "the wired bootstrap must enable the bounded bash default: {noticed}"
