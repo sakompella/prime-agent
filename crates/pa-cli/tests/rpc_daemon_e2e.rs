@@ -313,6 +313,33 @@ fn rpc_daemon_loss_during_the_eof_settle_exits_1() {
     );
 }
 
+/// The bound session is never observed, so unobserving its id cannot
+/// detach the main stream.
+#[test]
+fn rpc_observe_refuses_the_bound_session() {
+    let mut client = RpcChild::spawn(
+        &["--mode", "rpc"],
+        &json!({ "engine": "faux", "responses": ["still streaming"] }),
+    );
+    let state = client.request(&json!({ "type": "get_state" }));
+    let bound = state["data"]["activeSessionId"].clone();
+    assert!(bound.is_string(), "{state}");
+    let observed = client.request(&json!({ "type": "observe", "activeSessionId": bound }));
+    assert_eq!(
+        observed["error"],
+        format!(
+            "Cannot observe the session this connection is bound to: {}",
+            bound.as_str().unwrap()
+        ),
+        "{observed}"
+    );
+    let unobserved = client.request(&json!({ "type": "unobserve", "activeSessionId": bound }));
+    assert_eq!(unobserved["success"], true, "{unobserved}");
+    let response = client.request(&json!({ "type": "prompt", "message": "go" }));
+    assert_eq!(response["success"], true, "{response}");
+    client.wait_frame(|frame| is_assistant_end_with(frame, "still streaming"));
+}
+
 /// `--extension` fails before any daemon work: no supervisor starts.
 #[test]
 fn rpc_rejects_extensions_before_any_daemon_work() {
