@@ -285,7 +285,11 @@ struct Output {
     /// `Some` while a `prompt` response is pending: the session events wait
     /// here and follow the response (TS `promptResponsePending`).
     prompt_buffer: Option<Vec<Value>>,
+    /// By the id the client observed.
     observed: HashMap<String, Observation>,
+    /// A rebound observed session's current daemon id -> the id the client
+    /// observed (its frames keep reporting that id).
+    rebound: HashMap<String, String>,
 }
 
 /// One observed session, by the state of its `observe` response.
@@ -299,6 +303,14 @@ enum Observation {
 }
 
 impl Output {
+    /// The daemon id an observed session streams under now.
+    fn daemon_session_of(&self, observed_id: &str) -> String {
+        self.rebound
+            .iter()
+            .find(|(_, observed)| observed.as_str() == observed_id)
+            .map_or_else(|| observed_id.to_string(), |(daemon, _)| daemon.clone())
+    }
+
     fn emit(&mut self, writer: &LineWriter, frame: Value) {
         match self.prompt_buffer.as_mut() {
             Some(buffer) => buffer.push(frame),
@@ -467,7 +479,8 @@ impl RpcConnection {
                 };
                 let messages = match attached {
                     Ok(()) => {
-                        self.send(json!({ "type": "get_messages", "activeSessionId": target }))
+                        let streaming = self.output.lock().unwrap().daemon_session_of(target);
+                        self.send(json!({ "type": "get_messages", "activeSessionId": streaming }))
                             .await
                     }
                     Err(error) => Err(error),
@@ -482,10 +495,15 @@ impl RpcConnection {
             }
             RpcRoute::Unobserve => {
                 let target = payload["activeSessionId"].as_str().unwrap_or_default();
-                let observed = self.output.lock().unwrap().observed.remove(target);
-                if observed.is_some() {
+                let streaming = {
+                    let mut output = self.output.lock().unwrap();
+                    let streaming = output.daemon_session_of(target);
+                    output.rebound.remove(&streaming);
+                    output.observed.remove(target).map(|_| streaming)
+                };
+                if let Some(streaming) = streaming {
                     let _ = self
-                        .send(json!({ "type": "detach", "activeSessionId": target }))
+                        .send(json!({ "type": "detach", "activeSessionId": streaming }))
                         .await;
                 }
                 Ok(ResponseData::Absent)
@@ -554,7 +572,7 @@ impl RpcConnection {
     }
 
     /// Route one link event to stdout. Returns the interrupt a closed bound session causes.
-    fn route_event(&self, event: LinkEvent) -> Option<Interrupt> {
+    fn route_event(self: &Arc<Self>, event: LinkEvent) -> Option<Interrupt> {
         match event {
             LinkEvent::Session {
                 active_session_id,
@@ -566,20 +584,25 @@ impl RpcConnection {
                     output.emit(&self.writer, event);
                     return None;
                 }
-                let live = match output.observed.get(&active_session_id) {
+                let observed_id = output
+                    .rebound
+                    .get(&active_session_id)
+                    .cloned()
+                    .unwrap_or(active_session_id);
+                let live = match output.observed.get(&observed_id) {
                     Some(Observation::Live) => true,
                     Some(Observation::Pending { .. }) => false,
                     None => return None,
                 };
                 let frame = json!({
                     "type": "observed_session_event",
-                    "activeSessionId": active_session_id,
+                    "activeSessionId": observed_id,
                     "event": event,
                 });
                 if live {
                     output.emit(&self.writer, frame);
                 } else if let Some(Observation::Pending { frames, .. }) =
-                    output.observed.get_mut(&active_session_id)
+                    output.observed.get_mut(&observed_id)
                 {
                     frames.push(frame);
                 }
@@ -609,17 +632,21 @@ impl RpcConnection {
                     return (!completing).then(|| Interrupt::Lost(error.to_string()));
                 }
                 let mut output = self.output.lock().unwrap();
+                let observed_id = output
+                    .rebound
+                    .remove(&active_session_id)
+                    .unwrap_or(active_session_id);
                 let frame = json!({
                     "type": "observed_session_closed",
-                    "activeSessionId": active_session_id,
+                    "activeSessionId": observed_id,
                     "error": error,
                 });
-                match output.observed.remove(&active_session_id) {
+                match output.observed.remove(&observed_id) {
                     Some(Observation::Live) => output.emit(&self.writer, frame),
                     Some(Observation::Pending { mut frames, .. }) => {
                         frames.push(frame);
                         output.observed.insert(
-                            active_session_id,
+                            observed_id,
                             Observation::Pending {
                                 frames,
                                 closed: true,
@@ -630,13 +657,43 @@ impl RpcConnection {
                 }
                 None
             }
+            // A worker replacement moved a session to a new id. The routing
+            // follows at once and the link attaches the new id in the
+            // background (the supervisor does not move the subscription),
+            // like the TUI's rebind.
             LinkEvent::SessionBinding {
                 previous_active_session_id,
                 active_session_id,
             } => {
-                let mut binding = self.binding.lock().unwrap();
-                if binding.active_session_id == previous_active_session_id {
-                    binding.active_session_id = active_session_id;
+                let bound = {
+                    let mut binding = self.binding.lock().unwrap();
+                    let bound = binding.active_session_id == previous_active_session_id;
+                    if bound {
+                        binding.active_session_id.clone_from(&active_session_id);
+                    }
+                    bound
+                };
+                let observed = {
+                    let mut output = self.output.lock().unwrap();
+                    let observed_id = output
+                        .rebound
+                        .remove(&previous_active_session_id)
+                        .unwrap_or(previous_active_session_id);
+                    let observed = output.observed.contains_key(&observed_id);
+                    if observed {
+                        output
+                            .rebound
+                            .insert(active_session_id.clone(), observed_id);
+                    }
+                    observed
+                };
+                if bound || observed {
+                    let connection = Arc::clone(self);
+                    tokio::spawn(async move {
+                        let _ = connection
+                            .send(json!({ "type": "attach", "activeSessionId": active_session_id }))
+                            .await;
+                    });
                 }
                 None
             }
@@ -863,6 +920,7 @@ mod tests {
             output: Mutex::new(Output {
                 prompt_buffer: Some(Vec::new()),
                 observed: HashMap::new(),
+                rebound: HashMap::new(),
             }),
         });
         connection.output.lock().unwrap().observed.insert(
