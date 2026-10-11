@@ -247,9 +247,8 @@ fn rpc_observe_streams_a_child_session() {
     );
 }
 
-/// `navigate_tree` moves the leaf in place: the branch shortens, the file stays.
-#[test]
-fn rpc_navigate_tree_rolls_the_session_back_in_place() {
+/// A session that ran the turns "first turn" and "second turn".
+fn two_turn_session() -> RpcChild {
     let mut client = RpcChild::spawn(
         &["--mode", "rpc"],
         &json!({ "engine": "faux", "responses": ["one", "two"] }),
@@ -259,27 +258,64 @@ fn rpc_navigate_tree_rolls_the_session_back_in_place() {
         assert_eq!(response["success"], true, "{response}");
         client.wait_event("agent_end");
     }
-    let before = client.request(&json!({ "type": "get_state" }));
+    client
+}
+
+/// Roll the session back to before its second prompt, as T3 does.
+fn roll_back_the_second_turn(client: &mut RpcChild) -> Value {
     let forks = client.request(&json!({ "type": "get_fork_messages" }));
     let second_turn = forks["data"]["messages"][1]["entryId"].clone();
     assert!(second_turn.is_string(), "{forks}");
-    let navigated = client.request(&json!({ "type": "navigate_tree", "targetId": second_turn }));
+    client.request(&json!({ "type": "navigate_tree", "targetId": second_turn }))
+}
+
+/// The user and assistant texts `get_messages` answers.
+fn conversation_texts(client: &mut RpcChild) -> Vec<String> {
+    let messages = client.request(&json!({ "type": "get_messages" }));
+    messages["data"]["messages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the messages: {messages}"))
+        .iter()
+        .filter(|message| matches!(message["role"].as_str(), Some("user" | "assistant")))
+        .map(|message| first_text(message).to_string())
+        .collect()
+}
+
+/// The texts of the user entries `get_fork_messages` answers.
+fn fork_message_texts(client: &mut RpcChild) -> Vec<String> {
+    let forks = client.request(&json!({ "type": "get_fork_messages" }));
+    forks["data"]["messages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the fork messages: {forks}"))
+        .iter()
+        .map(|message| message["text"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// `navigate_tree` moves the leaf in place: the branch shortens, the file stays.
+#[test]
+fn rpc_navigate_tree_rolls_the_session_back_in_place() {
+    let mut client = two_turn_session();
+    let before = client.request(&json!({ "type": "get_state" }));
+    let navigated = roll_back_the_second_turn(&mut client);
     assert_eq!(
         navigated["data"],
         json!({ "cancelled": false, "editorText": "second turn" }),
         "{navigated}"
     );
-    let messages = client.request(&json!({ "type": "get_messages" }));
-    let texts: Vec<&str> = messages["data"]["messages"]
-        .as_array()
-        .expect("the messages")
-        .iter()
-        .filter(|message| matches!(message["role"].as_str(), Some("user" | "assistant")))
-        .map(first_text)
-        .collect();
-    assert_eq!(texts, vec!["first turn", "one"], "{messages}");
+    assert_eq!(conversation_texts(&mut client), vec!["first turn", "one"]);
     let after = client.request(&json!({ "type": "get_state" }));
     assert_eq!(after["data"]["sessionFile"], before["data"]["sessionFile"]);
+}
+
+/// T3 baselines its turns on `get_fork_messages`: after a rollback it lists
+/// only the active branch's user entries, not the abandoned one.
+#[test]
+fn rpc_get_fork_messages_lists_only_the_active_branch() {
+    let mut client = two_turn_session();
+    let navigated = roll_back_the_second_turn(&mut client);
+    assert_eq!(navigated["success"], true, "{navigated}");
+    assert_eq!(fork_message_texts(&mut client), vec!["first turn"]);
 }
 
 /// The faux turns of a session whose kernel reports its `T3_PROBE`.

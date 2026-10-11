@@ -401,6 +401,7 @@ pub fn entry_json(entry: &SessionEntry) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn message_entry(store: &mut SessionFile, role: &str, text: &str) -> String {
         store.append_message(&json!({
@@ -450,13 +451,72 @@ mod tests {
         let first = message_entry(&mut store, "user", "first prompt");
         message_entry(&mut store, "assistant", "answer");
         let second = message_entry(&mut store, "user", "second prompt");
-        let messages = user_messages_for_forking(&store);
+        let messages = user_messages_for_forking(&store, ForkMessageScope::Session);
         let ids: Vec<&str> = messages
             .iter()
             .filter_map(|m| m.get("entryId").and_then(Value::as_str))
             .collect();
         assert_eq!(ids, vec![first.as_str(), second.as_str()]);
         assert_eq!(messages[0]["text"], json!("first prompt"));
+    }
+
+    /// A random tree: entry `i` is a user or assistant message (its text
+    /// possibly empty) under one of the entries before it, or a new root.
+    fn random_tree(
+        shape: &[(Option<prop::sample::Index>, bool, bool)],
+    ) -> (SessionFile, Vec<String>) {
+        let mut store = SessionFile::create("/w", None, 0);
+        let mut ids: Vec<String> = Vec::new();
+        for (position, (parent, is_user, has_text)) in shape.iter().enumerate() {
+            let parent = parent
+                .filter(|_| position > 0)
+                .map(|parent| ids[parent.index(position)].clone());
+            store.branch_to(parent.as_deref()).unwrap();
+            let role = if *is_user { "user" } else { "assistant" };
+            let text = if *has_text {
+                format!("m{position}")
+            } else {
+                String::new()
+            };
+            ids.push(message_entry(&mut store, role, &text));
+        }
+        (store, ids)
+    }
+
+    proptest! {
+        /// Parents precede children in the file, so the whole-session list
+        /// filtered to the leaf's ancestors is already in root-to-leaf order.
+        #[test]
+        fn active_branch_fork_messages_are_the_leafs_ancestors_in_path_order(
+            shape in prop::collection::vec(
+                (prop::option::of(any::<prop::sample::Index>()), any::<bool>(), any::<bool>()),
+                1..24,
+            ),
+            leaf in prop::option::of(any::<prop::sample::Index>()),
+        ) {
+            let (mut store, ids) = random_tree(&shape);
+            let leaf = leaf.map(|leaf| ids[leaf.index(ids.len())].clone());
+            store.branch_to(leaf.as_deref()).unwrap();
+            let parents: std::collections::HashMap<&str, Option<&str>> = store
+                .entries()
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.parent_id.as_deref()))
+                .collect();
+            let mut ancestors = std::collections::HashSet::new();
+            let mut current = leaf.as_deref();
+            while let Some(id) = current {
+                ancestors.insert(id);
+                current = parents[id];
+            }
+            let expected: Vec<Value> = user_messages_for_forking(&store, ForkMessageScope::Session)
+                .into_iter()
+                .filter(|message| ancestors.contains(message["entryId"].as_str().unwrap()))
+                .collect();
+            prop_assert_eq!(
+                user_messages_for_forking(&store, ForkMessageScope::ActiveBranch),
+                expected
+            );
+        }
     }
 
     #[test]
