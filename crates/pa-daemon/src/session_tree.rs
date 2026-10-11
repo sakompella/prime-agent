@@ -84,32 +84,34 @@ pub fn flat_tree(store: &SessionFile) -> Vec<Value> {
         .collect()
 }
 
-/// `get_user_messages_for_forking`: user messages with their text, in file order.
-#[must_use]
-pub fn user_messages_for_forking(store: &SessionFile) -> Vec<Value> {
-    store
-        .entries()
-        .iter()
-        .filter(|entry| entry.type_ == "message")
-        .filter_map(|entry| entry.fields.get("message"))
-        .filter(|message| message_role(message) == Some("user"))
-        .filter_map(|message| {
-            let text = message_text(message);
-            (!text.is_empty())
-                .then_some(json!({ "entryId": entry_id_of(store, message), "text": text }))
-        })
-        .collect()
+/// Which user messages `get_user_messages_for_forking` lists: the payload's
+/// optional `scope`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ForkMessageScope {
+    /// Every user message in file order (TS `getUserMessagesForForking`, the
+    /// TUI `/fork` list).
+    #[default]
+    Session,
+    /// The active branch's user messages, root to leaf (the rpc
+    /// `get_fork_messages` turns T3 baselines on).
+    ActiveBranch,
 }
 
-/// The durable entry id of one message value: messages persist as the only
-/// entry kind carrying a `message` field, so the owning entry matches by identity.
-fn entry_id_of(store: &SessionFile, message: &Value) -> String {
-    store
-        .entries()
-        .iter()
-        .find(|entry| entry.fields.get("message") == Some(message))
-        .map(|entry| entry.id.clone())
-        .unwrap_or_default()
+/// `get_user_messages_for_forking`: the `scope`'s user messages with their text.
+#[must_use]
+pub fn user_messages_for_forking(store: &SessionFile, scope: ForkMessageScope) -> Vec<Value> {
+    let entries = match scope {
+        ForkMessageScope::Session => store.entries().iter().collect(),
+        ForkMessageScope::ActiveBranch => store.branch(),
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let text = user_entry_text(entry)?;
+            (!text.is_empty()).then(|| json!({ "entryId": entry.id, "text": text }))
+        })
+        .collect()
 }
 
 fn message_role(message: &Value) -> Option<&str> {
