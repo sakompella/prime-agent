@@ -53,6 +53,24 @@ pub fn collect_process_launch_env() -> BTreeMap<String, String> {
     )
 }
 
+/// Whether a var belongs to one session's client rather than the daemon:
+/// T3 Code's `T3_*` connection vars (MCP URL, bearer token, tool list,
+/// runtime mode). The supervisor's own copies come from whichever client
+/// started it, so a worker never inherits them; it gets only its session's.
+#[must_use]
+pub fn is_session_scoped(key: &str) -> bool {
+    key.starts_with("T3_")
+}
+
+/// The session-scoped entries of a launch env.
+#[must_use]
+pub fn session_scoped_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    env.iter()
+        .filter(|(key, _)| is_session_scoped(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -209,9 +209,36 @@ impl ResidentWorker {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = env;
     }
 
-    /// Drop the stored launch env (the ready-time and promotion clears).
+    /// Drop the stored launch env (the ready-time and promotion clears),
+    /// except its session-scoped vars: every respawn of this worker keeps
+    /// its client's T3 connection, which the daemon env never carries.
     pub(crate) fn clear_launch_env(&self) {
-        self.set_launch_env(None);
+        let mut launch_env = self
+            .launch_env
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *launch_env = launch_env
+            .as_ref()
+            .map(pa_types::daemon::launch_env::session_scoped_env)
+            .filter(|env| !env.is_empty());
+    }
+
+    /// Take a reusing client's session-scoped vars: the running process
+    /// keeps its env, a later respawn gets the newest client's T3
+    /// connection (v0.9.8 `command.launchEnv ?? existing.launchEnv`).
+    pub(crate) fn rebind_session_env(
+        &self,
+        client_launch_env: &std::collections::BTreeMap<String, String>,
+    ) {
+        use pa_types::daemon::launch_env::{is_session_scoped, session_scoped_env};
+        let mut launch_env = self
+            .launch_env
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut env = launch_env.take().unwrap_or_default();
+        env.retain(|key, _| !is_session_scoped(key));
+        env.extend(session_scoped_env(client_launch_env));
+        *launch_env = (!env.is_empty()).then_some(env);
     }
 
     pub(crate) fn route_state(&self) -> WorkerRouteState {
