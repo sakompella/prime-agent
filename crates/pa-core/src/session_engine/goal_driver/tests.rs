@@ -997,6 +997,13 @@ fn restore_persisted_adopts_the_state_without_rewriting_it() {
 fn branch_seedable_rules() {
     let mut session = persisted_session();
     assert!(GoalDriver::is_branch_seedable(&session));
+    session
+        .append_session_state(pa_types::session::SessionStateStatus::Active)
+        .unwrap();
+    assert!(
+        GoalDriver::is_branch_seedable(&session),
+        "the daemon's session_state row is bookkeeping, not use"
+    );
     let mut driver = GoalDriver::new();
     driver.start(&mut session, "work", None).unwrap();
     assert!(!GoalDriver::is_branch_seedable(&session));
