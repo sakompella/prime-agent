@@ -9,6 +9,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
+use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -22,8 +23,9 @@ pub struct RpcChild {
     stdin: Option<ChildStdin>,
     lines: Receiver<String>,
     next_id: u64,
-    /// The child's HOME and cwd: it must outlive the child.
-    home: tempfile::TempDir,
+    /// The child's HOME and cwd, shared with the clients that joined it:
+    /// it must outlive them all.
+    home: Rc<tempfile::TempDir>,
     pub socket: PathBuf,
     stderr: Option<ChildStderr>,
 }
@@ -39,10 +41,34 @@ impl RpcChild {
         script: &Value,
         configure: impl FnOnce(&Path, &mut Command),
     ) -> RpcChild {
-        let home = tempfile::TempDir::new().unwrap();
+        let home = Rc::new(tempfile::TempDir::new().unwrap());
+        Self::spawn_in(home, "worker-script.json", args, script, configure)
+    }
+
+    /// Spawn another client on this one's home and daemon; its session
+    /// runs `script` from `<home>/<script_name>`.
+    pub fn join(
+        &self,
+        script_name: &str,
+        args: &[&str],
+        script: &Value,
+        configure: impl FnOnce(&Path, &mut Command),
+    ) -> RpcChild {
+        Self::spawn_in(Rc::clone(&self.home), script_name, args, script, configure)
+    }
+
+    fn spawn_in(
+        home: Rc<tempfile::TempDir>,
+        script_name: &str,
+        args: &[&str],
+        script: &Value,
+        configure: impl FnOnce(&Path, &mut Command),
+    ) -> RpcChild {
         let socket = home.path().join("daemon.sock");
-        std::fs::write(home.path().join("worker-script.json"), script.to_string()).unwrap();
+        let script_path = home.path().join(script_name);
+        std::fs::write(&script_path, script.to_string()).unwrap();
         let mut command = rpc_command(home.path(), &socket, args);
+        command.env("PRIME_AGENT_FAUX_SCRIPT", &script_path);
         configure(home.path(), &mut command);
         let mut child = command.spawn().expect("binary present");
         let stdin = child.stdin.take().expect("stdin piped");
