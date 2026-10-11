@@ -486,6 +486,9 @@ pub async fn execute_ipython(
                 if let Some(start_line) = diff.start_line {
                     value["startLine"] = json!(start_line);
                 }
+                if diff.truncated {
+                    value["truncated"] = json!(true);
+                }
                 value
             })
             .collect::<Vec<_>>());
