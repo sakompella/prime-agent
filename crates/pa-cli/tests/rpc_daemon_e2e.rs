@@ -613,6 +613,77 @@ fn rpc_observe_refuses_the_bound_session() {
     client.wait_frame(|frame| is_assistant_end_with(frame, "still streaming"));
 }
 
+/// The faux session the `--goal` lanes run: one reply per turn.
+fn goal_session_script() -> Value {
+    json!({ "engine": "faux", "responses": ["on it", "still on it", "nearly there"] })
+}
+
+fn goal_of(state: &Value) -> (&Value, &Value) {
+    (
+        &state["data"]["goal"]["status"],
+        &state["data"]["goal"]["objective"],
+    )
+}
+
+/// `--goal` starts the rpc session's goal at session start, as print mode does.
+#[test]
+fn rpc_goal_flag_starts_the_sessions_goal() {
+    let mut client = RpcChild::spawn(
+        &["--mode", "rpc", "--goal", "ship it"],
+        &goal_session_script(),
+    );
+    let state = client.request(&json!({ "type": "get_state" }));
+    assert_eq!(
+        goal_of(&state),
+        (&json!("active"), &json!("ship it")),
+        "{state}"
+    );
+}
+
+/// A resumed session keeps its persisted goal over the `--goal` flag.
+#[test]
+fn rpc_goal_flag_keeps_a_resumed_sessions_goal() {
+    let mut first = RpcChild::spawn(&["--mode", "rpc"], &goal_session_script());
+    let response = first.request(&json!({ "type": "prompt", "message": "/goal first goal" }));
+    assert_eq!(response["success"], true, "{response}");
+    let (paused, _) = first.request_and_wait(
+        &json!({ "type": "prompt", "message": "/goal pause" }),
+        |frame| frame["type"] == "goal_update" && frame["goal"]["status"] == "paused",
+    );
+    assert_eq!(paused["success"], true, "{paused}");
+    let state = first.request(&json!({ "type": "get_state" }));
+    assert_eq!(
+        goal_of(&state),
+        (&json!("paused"), &json!("first goal")),
+        "{state}"
+    );
+    let session_file = state["data"]["sessionFile"]
+        .as_str()
+        .expect("a persisted session")
+        .to_string();
+    first.close_stdin();
+    assert_eq!(first.wait_closed().code(), Some(0));
+    let mut resumed = first.join(
+        "resumed-script.json",
+        &[
+            "--mode",
+            "rpc",
+            "--resume",
+            &session_file,
+            "--goal",
+            "ship it",
+        ],
+        &goal_session_script(),
+        |_, _| {},
+    );
+    let state = resumed.request(&json!({ "type": "get_state" }));
+    assert_eq!(
+        goal_of(&state),
+        (&json!("paused"), &json!("first goal")),
+        "{state}"
+    );
+}
+
 /// `--extension` fails before any daemon work: no supervisor starts.
 #[test]
 fn rpc_rejects_extensions_before_any_daemon_work() {
