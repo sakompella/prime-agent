@@ -157,6 +157,28 @@ impl SessionFile {
         self.persist_entry_at(entry_type, fields, &crate::util::now_iso())
     }
 
+    /// Persist a custom message (wire `role: "custom"`) as its
+    /// `custom_message` row, stamped with the message's own epoch-ms
+    /// timestamp, so the history rebuilds the timestamp its live frame carried.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable append fails.
+    pub fn persist_custom_message(&mut self, message: &Value) -> Result<String> {
+        let timestamp = crate::types::message_timestamp_ms(message)
+            .map_or_else(crate::util::now_iso, crate::util::iso_from_unix_ms);
+        self.persist_entry_at(
+            "custom_message",
+            json!({
+                "customType": message.get("customType").cloned().unwrap_or(Value::Null),
+                "content": message.get("content").cloned().unwrap_or(Value::Null),
+                "display": message.get("display").cloned().unwrap_or(Value::Bool(true)),
+                "details": message.get("details").cloned().unwrap_or(Value::Null),
+            }),
+            &timestamp,
+        )
+    }
+
     /// Durably mark that this session has drawn the Anthropic subscription
     /// ban-risk warning (the once-per-session-lifecycle gate, operator
     /// directive 2026-09-29): append the
