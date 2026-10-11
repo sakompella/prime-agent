@@ -905,92 +905,199 @@ mod tests {
 
     use super::*;
 
-    /// A worker replacement rebinds the bound session and an observed child:
-    /// the connection attaches both new ids and routes their events in their
-    /// old roles (the bound stream, the child observed under the id the
-    /// client asked for).
-    #[tokio::test]
-    async fn a_session_binding_attaches_and_routes_the_rebound_sessions() {
-        let (writer, mut commands) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let connection = Arc::new(RpcConnection {
-            link: Arc::new(DaemonLink::scripted(writer, Arc::clone(&pending))),
-            writer: LineWriter::spawn(),
-            binding: Mutex::new(Binding {
-                active_session_id: "root".to_string(),
-                lifecycle: DaemonSessionLifecycle::ClientOwned,
-                completing: false,
-                daemon_closing: None,
-            }),
-            output: Mutex::new(Output {
-                prompt_buffer: Some(Vec::new()),
-                observed: HashMap::new(),
-                rebound: HashMap::new(),
-            }),
-        });
-        connection.output.lock().unwrap().observed.insert(
-            "kid".to_string(),
-            Observation::Pending {
-                frames: Vec::new(),
-                closed: false,
-            },
-        );
-        for (previous, current) in [("root", "root-2"), ("kid", "kid-2")] {
-            connection.route_event(LinkEvent::SessionBinding {
+    /// A connection bound to `root` over a scripted link, observing each of
+    /// `observed` live. A pending prompt response holds every emitted frame
+    /// in the prompt buffer, which the tests read as stdout.
+    struct Scripted {
+        connection: Arc<RpcConnection>,
+        commands: tokio::sync::mpsc::UnboundedReceiver<String>,
+        pending: crate::daemon_link::PendingResponses,
+        interrupts: tokio::sync::mpsc::UnboundedReceiver<Interrupt>,
+    }
+
+    impl Scripted {
+        fn new(observed: &[&str]) -> Scripted {
+            let (writer, commands) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let (_interrupts_tx, interrupts) = tokio::sync::mpsc::unbounded_channel();
+            let connection = Arc::new(RpcConnection {
+                link: Arc::new(DaemonLink::scripted(writer, Arc::clone(&pending))),
+                writer: LineWriter::spawn(),
+                binding: Mutex::new(Binding {
+                    active_session_id: "root".to_string(),
+                    lifecycle: DaemonSessionLifecycle::ClientOwned,
+                    completing: false,
+                    daemon_closing: None,
+                }),
+                output: Mutex::new(Output {
+                    prompt_buffer: Some(Vec::new()),
+                    observed: observed
+                        .iter()
+                        .map(|id| ((*id).to_string(), Observation::Live))
+                        .collect(),
+                    rebound: HashMap::new(),
+                }),
+            });
+            Scripted {
+                connection,
+                commands,
+                pending,
+                interrupts,
+            }
+        }
+
+        fn bind(&self, previous: &str, current: &str) {
+            self.connection.route_event(LinkEvent::SessionBinding {
                 previous_active_session_id: previous.to_string(),
                 active_session_id: current.to_string(),
             });
         }
-        let mut attached = Vec::new();
-        for _ in 0..2 {
-            let line = tokio::time::timeout(Duration::from_secs(5), commands.recv())
+
+        fn event(&self, active_session_id: &str) {
+            self.connection.route_event(LinkEvent::Session {
+                active_session_id: active_session_id.to_string(),
+                event: json!({ "type": "agent_end" }),
+            });
+        }
+
+        /// The next command line the connection sent, as the daemon reads it.
+        async fn next_command(&mut self) -> DaemonCommandEnvelope {
+            let line = tokio::time::timeout(Duration::from_secs(5), self.commands.recv())
                 .await
-                .expect("the rebound session is attached")
+                .expect("the connection sends a command")
                 .expect("the link writer is open");
-            let envelope: DaemonCommandEnvelope = serde_json::from_str(&line).unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+
+        /// The next attach's session id; its answer is left to the test.
+        async fn next_attach(&mut self) -> (String, String) {
+            let envelope = self.next_command().await;
             let DaemonCommand::Attach {
                 active_session_id, ..
             } = envelope.command
             else {
                 panic!("expected an attach, got {:?}", envelope.command);
             };
-            let reply = pending.lock().unwrap().remove(&envelope.id).unwrap();
+            (envelope.id, active_session_id)
+        }
+
+        fn answer(&self, envelope_id: &str, outcome: Result<(), &str>) {
+            let reply = self.pending.lock().unwrap().remove(envelope_id).unwrap();
             reply
                 .send(DaemonResponse {
-                    id: Some(envelope.id),
+                    id: Some(envelope_id.to_string()),
                     command: "attach".to_string(),
-                    success: true,
+                    success: outcome.is_ok(),
                     data: None,
-                    error: None,
+                    error: outcome.err().map(str::to_string),
                     error_info: None,
                 })
                 .unwrap();
+        }
+
+        fn stdout(&self) -> Vec<Value> {
+            self.connection
+                .output
+                .lock()
+                .unwrap()
+                .prompt_buffer
+                .clone()
+                .unwrap_or_default()
+        }
+    }
+
+    fn observed_end(observed_id: &str) -> Value {
+        json!({
+            "type": "observed_session_event",
+            "activeSessionId": observed_id,
+            "event": { "type": "agent_end" },
+        })
+    }
+
+    /// A worker replacement rebinds the bound session and an observed child:
+    /// the connection attaches both new ids and routes their events in their
+    /// old roles (the bound stream, the child observed under the id the
+    /// client asked for).
+    #[tokio::test]
+    async fn a_session_binding_attaches_and_routes_the_rebound_sessions() {
+        let mut scripted = Scripted::new(&["kid"]);
+        scripted.bind("root", "root-2");
+        scripted.bind("kid", "kid-2");
+        let mut attached = Vec::new();
+        for _ in 0..2 {
+            let (envelope_id, active_session_id) = scripted.next_attach().await;
+            scripted.answer(&envelope_id, Ok(()));
             attached.push(active_session_id);
         }
         attached.sort();
         assert_eq!(attached, vec!["kid-2", "root-2"]);
-        for id in ["root-2", "kid-2"] {
-            connection.route_event(LinkEvent::Session {
-                active_session_id: id.to_string(),
-                event: json!({ "type": "agent_end" }),
-            });
-        }
-        let output = connection.output.lock().unwrap();
+        scripted.event("root-2");
+        scripted.event("kid-2");
         assert_eq!(
-            output.prompt_buffer,
-            Some(vec![json!({ "type": "agent_end" })]),
-            "the rebound bound session streams unwrapped"
+            scripted.stdout(),
+            vec![json!({ "type": "agent_end" }), observed_end("kid")],
+            "the bound stream follows unwrapped, the child under its observed id"
         );
-        let Some(Observation::Pending { frames, .. }) = output.observed.get("kid") else {
-            panic!("the child stays observed under its requested id");
+    }
+
+    /// Frames from an observed child's superseded id neither close nor feed
+    /// the observation once it streams under the new id.
+    #[tokio::test]
+    async fn a_superseded_id_cannot_close_the_rebound_observation() {
+        let mut scripted = Scripted::new(&["kid"]);
+        scripted.bind("kid", "kid-2");
+        let (envelope_id, _) = scripted.next_attach().await;
+        scripted.answer(&envelope_id, Ok(()));
+        scripted.event("kid");
+        scripted.connection.route_event(LinkEvent::SessionClosed {
+            active_session_id: "kid".to_string(),
+            reason: DaemonSessionClosedReason::Replaced,
+        });
+        scripted.event("kid-2");
+        assert_eq!(scripted.stdout(), vec![observed_end("kid")]);
+    }
+
+    /// A refused reattach is never swallowed: the bound session's ends the
+    /// process as a loss, an observed child's closes its observation. A
+    /// newer binding makes the earlier attempt's result stale.
+    #[tokio::test]
+    async fn a_refused_reattach_ends_the_stream_it_was_for() {
+        let mut scripted = Scripted::new(&["kid"]);
+        scripted.bind("root", "root-2");
+        scripted.bind("root-2", "root-3");
+        scripted.bind("kid", "kid-2");
+        scripted.bind("kid-2", "kid-3");
+        let mut attaches = HashMap::new();
+        for _ in 0..4 {
+            let (envelope_id, active_session_id) = scripted.next_attach().await;
+            attaches.insert(active_session_id, envelope_id);
+        }
+        for id in ["root-2", "kid-2", "kid-3", "root-3"] {
+            scripted.answer(&attaches[id], Err("Session worker is overloaded"));
+        }
+        let interrupt = tokio::time::timeout(Duration::from_secs(5), scripted.interrupts.recv())
+            .await
+            .expect("the refusal interrupts the connection");
+        let Some(Interrupt::Lost(reason)) = interrupt else {
+            panic!("the refused bound reattach is a loss");
         };
         assert_eq!(
-            frames,
-            &vec![json!({
-                "type": "observed_session_event",
+            reason,
+            "The session moved to root-3, and attaching it failed: Session worker is overloaded"
+        );
+        assert!(
+            scripted.interrupts.try_recv().is_err(),
+            "the stale root-2 attempt raised nothing"
+        );
+        scripted.event("kid-3");
+        assert_eq!(
+            scripted.stdout(),
+            vec![json!({
+                "type": "observed_session_closed",
                 "activeSessionId": "kid",
-                "event": { "type": "agent_end" },
-            })]
+                "error": "The session moved to kid-3, and attaching it failed: Session worker is overloaded",
+            })],
+            "only the current attempt closes the observation, which then stops streaming"
         );
     }
 }
