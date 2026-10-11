@@ -1035,7 +1035,15 @@ async fn start_kernel_impl(
         gate().await;
     }
     let snapshot_dir = options.snapshot_dir.clone();
-    let bootstrap_code = build_rlm_bootstrap_code(&options.python_skills);
+    // The kernel sees the process env overlaid with `options.env`.
+    let t3_code = crate::T3Code::from_env(|key| {
+        options
+            .env
+            .get(key)
+            .cloned()
+            .or_else(|| std::env::var(key).ok())
+    });
+    let bootstrap_code = build_rlm_bootstrap_code(&options.python_skills, t3_code);
     let mut env = options.env.clone();
     if let Some(shell_path) = &options.shell_path {
         env.insert(

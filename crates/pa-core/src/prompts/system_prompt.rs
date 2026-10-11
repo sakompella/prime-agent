@@ -2,6 +2,8 @@
 //! every session-specific value last. See the parent module docs.
 
 use crate::skills::{format_skills_for_prompt, Skill};
+use crate::t3_code::T3_CODE_MCP_SERVER;
+use crate::T3Code;
 
 use super::layers;
 
@@ -90,6 +92,9 @@ pub struct BuildSystemPromptOptions<'a> {
     pub rlm_parent_agent: Option<&'a str>,
     /// Enabled user-configured generic MCP servers.
     pub generic_mcp_servers: Vec<String>,
+    /// Whether the session runs in T3 Code. `Present` adds the `t3` module
+    /// section and drops T3's own server from the generic MCP list.
+    pub t3_code: T3Code,
 }
 
 /// Build the system prompt (assembled text only).
@@ -183,7 +188,23 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
     }
 
     if has_ipython {
-        let mcp = format_generic_mcp_guidance(&options.generic_mcp_servers);
+        let generic_mcp_servers = match options.t3_code {
+            T3Code::Absent => options.generic_mcp_servers.clone(),
+            T3Code::Present => {
+                segments.push(PromptSegment::dynamic_segment(
+                    "t3-code",
+                    "T3 Code env",
+                    T3_CODE_SECTION.to_string(),
+                ));
+                options
+                    .generic_mcp_servers
+                    .iter()
+                    .filter(|server| *server != T3_CODE_MCP_SERVER)
+                    .cloned()
+                    .collect()
+            }
+        };
+        let mcp = format_generic_mcp_guidance(&generic_mcp_servers);
         if !mcp.is_empty() {
             segments.push(PromptSegment::dynamic_segment(
                 "mcp-servers",
@@ -242,6 +263,8 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
         cached_prefix_len,
     }
 }
+
+const T3_CODE_SECTION: &str = "# T3 Code\n\nThis session runs in T3 Code. The pre-imported Python `t3` module calls T3's tools as async methods, for example `await t3.project_list()`.\nBefore the first T3 call, read `help(t3)` for the method index and errors, then `help(t3.<method>)` for that method's parameters.";
 
 fn packages_section() -> String {
     use crate::kernel::bootstrap::default_rlm_extra_import_labels;
@@ -397,7 +420,6 @@ fn format_generic_mcp_guidance(servers: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::skills::{create_synthetic_source_info, SkillKind, SourceScope};
-    use crate::T3Code;
     use std::path::PathBuf;
 
     fn skill(name: &str, import: Option<&str>) -> Skill {
@@ -526,7 +548,10 @@ mod tests {
     #[test]
     fn t3_sessions_point_at_the_t3_module_instead_of_the_t3_code_server() {
         let cases = [
-            (T3Code::Absent, "Enabled generic MCP servers: `slack`, `t3-code`."),
+            (
+                T3Code::Absent,
+                "Enabled generic MCP servers: `slack`, `t3-code`.",
+            ),
             (T3Code::Present, "Enabled generic MCP servers: `slack`."),
         ];
         for (t3_code, generic_line) in cases {

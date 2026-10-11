@@ -3,6 +3,7 @@
 //! Python skill.
 
 use super::KernelPythonSkill;
+use crate::T3Code;
 
 /// Line the runtime bootstrap prints when one or more pre-imported Python skills failed to import.
 /// The host scans the bootstrap cell's stdout for this marker.
@@ -72,11 +73,35 @@ except Exception as _prime_agent_rlm_error:
         rlm._raise_missing()
 "#;
 
+/// Binds `t3` in T3 sessions. A failed import binds a stub that raises the import error, so the
+/// rest of the bootstrap still runs.
+const RLM_BOOTSTRAP_T3_CODE: &str = r#"
+try:
+    import rlm.t3 as t3
+except Exception as _prime_agent_t3_error:
+    _PRIME_AGENT_T3_IMPORT_ERROR = str(_prime_agent_t3_error) or type(_prime_agent_t3_error).__name__
+
+    class _PrimeAgentMissingT3:
+        def __getattr__(self, name):
+            if name.startswith("_"):
+                raise AttributeError(name)
+            raise RuntimeError(
+                "The t3 module failed to import in this kernel, so T3 Code's tools are unavailable. "
+                f"Import error: {_PRIME_AGENT_T3_IMPORT_ERROR}"
+            )
+
+    t3 = _PrimeAgentMissingT3()
+"#;
+
 /// The code the session injects right after kernel start/restore: binds the `rlm`, `bash`, and MCP
-/// surfaces, imports every Python skill.
+/// surfaces (plus `t3` in T3 sessions), imports every Python skill.
 #[must_use]
-pub fn build_rlm_bootstrap_code(python_skills: &[KernelPythonSkill]) -> String {
-    let base_code = format!("{RLM_BOOTSTRAP_HEADER_CODE}\n\n{RLM_BOOTSTRAP_RUNTIME_CODE}");
+pub fn build_rlm_bootstrap_code(python_skills: &[KernelPythonSkill], t3_code: T3Code) -> String {
+    let t3_code = match t3_code {
+        T3Code::Absent => "",
+        T3Code::Present => RLM_BOOTSTRAP_T3_CODE,
+    };
+    let base_code = format!("{RLM_BOOTSTRAP_HEADER_CODE}\n\n{RLM_BOOTSTRAP_RUNTIME_CODE}{t3_code}");
     // TS: `[...new Set(pythonSkills.map(...))]` — first-seen order, so the pre-import loop follows
     // the session's skill discovery order.
     let mut import_names: Vec<&str> = Vec::new();
@@ -176,7 +201,6 @@ if _PRIME_AGENT_SKILL_IMPORT_ERRORS:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::T3Code;
     use std::path::PathBuf;
 
     #[test]

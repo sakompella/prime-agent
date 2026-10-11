@@ -489,6 +489,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             // the child-agent reply doctrine, never the root identity.
             rlm_depth: config.rlm_depth,
             generic_mcp_servers,
+            t3_code: crate::T3Code::from_env(|key| std::env::var(key).ok()),
             prompt_guidelines: Some(prompt_guidelines),
             ..Default::default()
         },

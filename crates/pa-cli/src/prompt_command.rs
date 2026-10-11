@@ -118,6 +118,7 @@ fn assemble_breakdown(
             selected_tools: Some(vec!["ipython"]),
             allow_recursion: Some(true),
             generic_mcp_servers: generic_servers,
+            t3_code: pa_core::T3Code::from_env(|key| std::env::var(key).ok()),
             rlm_depth: Some(0),
             ..Default::default()
         },
