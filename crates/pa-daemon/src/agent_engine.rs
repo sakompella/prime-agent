@@ -67,8 +67,8 @@ pub(crate) use artifacts::{artifact_reference, now_millis};
 
 pub use config::AgentEngineConfig;
 pub(crate) use config::AutonomousAdmission;
-pub(crate) use config::CreateSessionResources;
 pub use config::SupervisorLinkConfig;
+pub(crate) use config::{CreateSessionResources, InitialGoal};
 use config::{GoalRuntimeHandles, ProducerUsageSink, RestoredSessionModel, StartupScope};
 
 mod reload;

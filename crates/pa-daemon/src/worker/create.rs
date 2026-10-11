@@ -95,7 +95,7 @@ impl Worker {
         });
         // Folded before the background build spawn at the create's tail,
         // so the first build sees them.
-        let resources = match CreateSessionResources::deserialize(payload) {
+        let mut resources = match CreateSessionResources::deserialize(payload) {
             Ok(resources) => resources,
             Err(error) => {
                 return response_failure(
@@ -106,6 +106,7 @@ impl Worker {
                 );
             }
         };
+        let initial_goal = resources.initial_goal.take();
         if let Some(agent_engine) = &self.agent_engine {
             if let Some(autonomous) = &resources.autonomous {
                 *agent_engine.autonomous.lock().await =
@@ -623,15 +624,32 @@ impl Worker {
         }
         // Deliberate divergence from TS's eager create build: the response stays
         // model-independent; a build failure surfaces on the first demand seam.
+        // A `--goal` create is the exception: the seed needs the built session,
+        // and the create answers with the goal live (RLM children never seed).
         if let Some(agent_engine) = &self.agent_engine {
-            let engine = std::sync::Arc::clone(agent_engine);
-            tokio::spawn(async move {
-                let Ok(model) = engine.resolve_model() else {
-                    return;
-                };
-                let _ = engine.ensure_core_session_async(&model).await;
-            });
+            if let Some(goal) = initial_goal.filter(|_| rlm_depth == 0) {
+                match agent_engine.seed_initial_goal(&goal).await {
+                    Ok(Some(started)) => {
+                        if let Err(error) = self.persist_started_goal(&started) {
+                            return response_failure(None, "create", &format!("{error:#}"), None);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        return response_failure(None, "create", &format!("{error:#}"), None);
+                    }
+                }
+            } else {
+                let engine = std::sync::Arc::clone(agent_engine);
+                tokio::spawn(async move {
+                    let Ok(model) = engine.resolve_model() else {
+                        return;
+                    };
+                    let _ = engine.ensure_core_session_async(&model).await;
+                });
+            }
         }
+
         // Bind the schedule catalog onto the session (artifact partition,
         // job rebind, scheduler start) — TS `rebindCronJobsToState`.
         if let Err(error) = self.bind_scheduled_jobs().await {
@@ -689,6 +707,23 @@ impl Worker {
         // file: return the load's freed heap to the OS.
         pa_types::memory_release::trim_freed_heap();
         response_success(None, "create", Some(data))
+    }
+
+    /// Record a seeded goal's `thread_goal_state` row, then announce it: a client never
+    /// sees a started goal the session file does not hold. An in-memory session has no
+    /// file to write.
+    pub(super) fn persist_started_goal(&self, goal: &Value) -> Result<()> {
+        if let Some(store) = self.core.lock().unwrap().store.as_mut() {
+            store.persist_entry(
+                "custom",
+                json!({
+                    "customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE,
+                    "data": goal,
+                }),
+            )?;
+        }
+        self.emit_worker_event(json!({ "type": "goal_update", "goal": goal }));
+        Ok(())
     }
 
     /// (Re)bind the pane reporter from the create payload (the TS

@@ -218,6 +218,13 @@ fn daemon_session_create(
     if let Some(autonomous) = &config.autonomous {
         create_config["autonomous"] = serde_json::json!(autonomous_runtime_config(autonomous));
     }
+    if let Some(goal) = &config.initial_goal {
+        let mut initial_goal = serde_json::json!({ "objective": goal.objective });
+        if let Some(token_budget) = goal.token_budget {
+            initial_goal["tokenBudget"] = serde_json::json!(token_budget);
+        }
+        create_config["initialGoal"] = initial_goal;
+    }
     // Verification seam (the interactive mode's contract): a scripted daemon
     // session from a script FILE path. The product never sets it.
     if let Some(script) = std::env::var_os("PRIME_AGENT_FAUX_SCRIPT") {

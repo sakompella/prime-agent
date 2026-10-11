@@ -143,6 +143,37 @@ impl AgentSessionEngine {
         }
     }
 
+    /// Seed the create's `--goal` objective on the built session (the print
+    /// runtime's seed): builds the session first, so the goal is live when
+    /// the create answers. Returns the started goal for the worker's durable
+    /// row; `None` when the branch is not seedable (a resumed session keeps
+    /// its own goal).
+    ///
+    /// # Errors
+    ///
+    /// Returns the model resolution, session build, or goal validation error.
+    pub(crate) async fn seed_initial_goal(
+        &self,
+        goal: &super::InitialGoal,
+    ) -> anyhow::Result<Option<Value>> {
+        let model = self.resolve_model()?;
+        self.ensure_core_session_async(&model).await?;
+        let core = self
+            .session
+            .lock()
+            .await
+            .clone()
+            .expect("session built by ensure_core_session_async");
+        if !core
+            .seed_initial_goal(&goal.objective, goal.token_budget)
+            .await?
+        {
+            return Ok(None);
+        }
+        let state = core.goal_driver.lock().await.state_with_creation_elapsed();
+        Ok(self.publish_goal_state(&state))
+    }
+
     /// Mirror the built session's goal handles: the core session's mutex
     /// stays held across a turn's admission, so goal checks in emit callbacks
     /// read the mirror.

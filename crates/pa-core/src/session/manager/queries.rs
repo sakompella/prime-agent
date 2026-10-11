@@ -303,6 +303,7 @@ impl SessionManager {
                         | FileEntry::ModelChange { .. }
                         | FileEntry::ThinkingLevelChange { .. }
                         | FileEntry::ServiceTierChange { .. }
+                        | FileEntry::SessionState { .. }
                 )
             })
     }

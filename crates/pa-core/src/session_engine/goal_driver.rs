@@ -210,7 +210,8 @@ impl GoalDriver {
     }
 
     /// Whether the branch may be seeded with an initial goal: only bootstrap
-    /// entries (model/thinking changes) and no prior persisted goal.
+    /// entries (model/thinking changes, the daemon's `session_state`
+    /// bookkeeping) and no prior persisted goal.
     #[must_use]
     pub fn is_branch_seedable(session: &SessionManager) -> bool {
         !session.has_non_bootstrap_entries()
