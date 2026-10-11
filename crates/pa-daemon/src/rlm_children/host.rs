@@ -515,13 +515,16 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         SupervisorChildSessionsInner::arm_usage_watch(&this, record).await;
                     }
                 }
-                let still_running = record.lock().await.settled_status.is_none();
-                if still_running {
+                if !record.lock().await.settled {
+                    // A blocking collect parks the parent's turn on this child:
+                    // a task prompt still waiting for that turn to end would
+                    // only start at the gate's bound.
+                    if timeout_ms > 0 && !record.lock().await.prompt_admitted {
+                        this.release_turn_gated_prompts();
+                    }
                     // Wait inside the shared budget, then re-read the child:
                     // a timeout yields the current snapshot, never an error.
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    let active_session_id = record.lock().await.active_session_id.clone();
-                    this.wait_for_child(&active_session_id, remaining).await;
+                    this.wait_for_settle(record, deadline).await;
                     this.refresh_record(record).await;
                 }
                 let result = {
