@@ -508,6 +508,64 @@ fn rpc_get_fork_messages_lists_only_the_active_branch() {
     assert_eq!(fork_message_texts(&mut client), vec!["first turn"]);
 }
 
+/// T3 Code keys a tool cell by the `toolName` of every frame, as 0.9.8
+/// framed it: an update carries `toolName` and `args`, an end `toolName`
+/// and `isError`. A frame without it turns an edit cell into an unnamed
+/// tool and drops its edit card.
+#[test]
+fn rpc_tool_frames_name_their_tool_on_every_frame() {
+    if kernel_python().is_none() {
+        return;
+    }
+    let script = json!({ "engine": "faux", "responses": [
+        ipython_call("await edit(path='notes.txt', old_str='alpha', new_str='beta')\nprint('edited')"),
+        { "text": "edited" },
+    ] });
+    let mut client = RpcChild::spawn_configured(&["--mode", "rpc"], &script, |home, _| {
+        std::fs::write(home.join("notes.txt"), "alpha\n").unwrap();
+    });
+    let prompt_id = client.command(&json!({ "type": "prompt", "message": "edit the notes" }));
+    let (end, before) = client.wait_frame(|frame| frame["type"] == "tool_execution_end");
+    assert!(
+        before
+            .iter()
+            .any(|frame| frame["id"] == prompt_id.as_str() && frame["success"] == true),
+        "the prompt is accepted: {before:?}"
+    );
+    let start = before
+        .iter()
+        .find(|frame| frame["type"] == "tool_execution_start")
+        .expect("the cell starts before it ends");
+    let updates: Vec<&Value> = before
+        .iter()
+        .filter(|frame| frame["type"] == "tool_execution_update")
+        .collect();
+    assert!(
+        !updates.is_empty(),
+        "the cell streams its output: {before:?}"
+    );
+    for frame in updates.iter().copied().chain([start, &end]) {
+        assert_eq!(
+            (&frame["toolCallId"], &frame["toolName"]),
+            (&start["toolCallId"], &json!("ipython")),
+            "every frame of the cell names its tool: {frame}"
+        );
+    }
+    for update in &updates {
+        assert_eq!(
+            update["args"], start["args"],
+            "an update carries the call's args: {update}"
+        );
+    }
+    assert_eq!(end["isError"], false, "{end}");
+    let diff = &end["result"]["details"]["diffs"][0];
+    assert_eq!(
+        (&diff["oldStr"], &diff["newStr"]),
+        (&json!("alpha"), &json!("beta")),
+        "the end carries the edit's diff: {end}"
+    );
+}
+
 /// The faux turns of a session whose kernel reports its `T3_PROBE`.
 fn t3_probe_script() -> Value {
     json!({ "engine": "faux", "responses": [
