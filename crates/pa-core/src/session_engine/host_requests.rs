@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use crate::cron::store::{
     AgentCronJobStore, CreateAgentCronJobInput, RlmHeartbeatStatusUpdate, RlmHeartbeatUpdate,
 };
-use crate::cron::{AgentCronJob, DeliveryMode, JobStatus};
+use crate::cron::{normalize_heartbeat_schedule, AgentCronJob, DeliveryMode, JobStatus};
 use crate::goals::{goal_host_response, GoalHostResponse, GoalState, GoalStatus};
 use crate::session::manager::SessionManager;
 
@@ -231,7 +231,7 @@ pub fn handle_rlm_heartbeat_host_request(
             let label = string_field("label")?;
             create_input.prompt = instruction.to_string();
             create_input.label = label;
-            create_input.schedule_text = interval.unwrap_or_else(|| "every 5m".to_string());
+            create_input.schedule_text = normalize_heartbeat_schedule(interval.as_deref());
             create_input.delivery_mode = delivery_mode;
             let heartbeat = store.create_rlm_heartbeat(&create_input)?;
             let response = json!({ "heartbeat": rlm_heartbeat_host_response(&heartbeat) });
@@ -286,7 +286,9 @@ pub fn handle_rlm_heartbeat_host_request(
                 &RlmHeartbeatUpdate {
                     label,
                     prompt: instruction,
-                    schedule_text: interval,
+                    schedule_text: interval
+                        .as_deref()
+                        .map(|interval| normalize_heartbeat_schedule(Some(interval))),
                     status,
                     delivery_mode,
                     now: Some(now),
