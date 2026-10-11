@@ -203,7 +203,10 @@ pub fn kernel_python_skills(skills: &[Skill]) -> Vec<KernelPythonSkill> {
 /// Build the kernel provisioner for a session: host handlers for the goal/heartbeat bridge
 /// plus the pre-imported skills. The session's agent dir is propagated into the kernel env
 /// (`PRIME_AGENT_CODING_AGENT_DIR`): an embedding host whose ambient env differs must not
-/// leak its own paths into the kernel (#109). `cwd` is the SESSION's working directory.
+/// leak its own paths into the kernel (#109). The harness stores follow the same rule: the
+/// global store is the agent dir's, and a persistent session's local store is
+/// `<session_artifact_dir>/harness`, the dir the host reads for the harness digest. `cwd`
+/// is the SESSION's working directory.
 #[allow(clippy::too_many_arguments)] // one wiring funnel, same style as AgentSession::from_session_arc
 #[must_use]
 pub fn kernel_provisioner(
@@ -212,17 +215,37 @@ pub fn kernel_provisioner(
     python_skills: Vec<KernelPythonSkill>,
     cwd: std::path::PathBuf,
     agent_dir: &std::path::Path,
-    snapshot_dir: Option<std::path::PathBuf>,
+    session_artifact_dir: Option<std::path::PathBuf>,
     on_restore: Option<crate::kernel::provisioner::RestoreCallback>,
     on_background_work_settled: Option<crate::kernel::shared::BackgroundWorkSettledCallback>,
     on_unavailable_skills: Option<crate::kernel::provisioner::UnavailableSkillsCallback>,
     on_bootstrap_result: Option<crate::kernel::provisioner::KernelBootstrapResultHandler>,
 ) -> Arc<KernelProvisioner> {
-    let mut env = HashMap::with_capacity(1);
-    env.insert(
-        "PRIME_AGENT_CODING_AGENT_DIR".to_string(),
-        agent_dir.to_string_lossy().to_string(),
-    );
+    let mut env = HashMap::from([
+        (
+            "PRIME_AGENT_CODING_AGENT_DIR".to_string(),
+            agent_dir.to_string_lossy().to_string(),
+        ),
+        (
+            "RLM_GLOBAL_HARNESS_STATE_DIR".to_string(),
+            crate::refinement::get_global_harness_state_dir(agent_dir)
+                .to_string_lossy()
+                .to_string(),
+        ),
+    ]);
+    if let Some(artifact_dir) = &session_artifact_dir {
+        env.insert(
+            "RLM_SESSION_DIR".to_string(),
+            artifact_dir.to_string_lossy().to_string(),
+        );
+        env.insert(
+            "RLM_HARNESS_STATE_DIR".to_string(),
+            artifact_dir
+                .join(crate::refinement::HARNESS_STATE_DIR_NAME)
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
     Arc::new(KernelProvisioner::new(
         cwd,
         IpythonKernelProvisionerOptions {
@@ -235,7 +258,7 @@ pub fn kernel_provisioner(
             python_skills,
             // Only persistent sessions (which have an artifact dir) get
             // a revivable snapshot (TS `snapshotDir`).
-            snapshot_dir,
+            snapshot_dir: session_artifact_dir,
             ready_gate: None,
             on_restore,
             on_background_work_settled,
