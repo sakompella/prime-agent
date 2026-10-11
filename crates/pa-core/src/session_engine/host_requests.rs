@@ -536,4 +536,69 @@ mod tests {
             .to_string()
             .contains("unknown RLM heartbeat request type"));
     }
+
+    fn created_schedule(interval: &str) -> Value {
+        let created = handle_rlm_heartbeat_host_request(
+            "rlm_heartbeat.create",
+            &json!({ "instruction": "tick", "interval": interval }),
+            &heartbeat_store(),
+            "live-1",
+            &binding(),
+        )
+        .unwrap_or_else(|error| panic!("create with interval {interval:?}: {error}"));
+        created.response["heartbeat"]["schedule"].clone()
+    }
+
+    fn updated_schedule(interval: &str) -> Value {
+        let store = heartbeat_store();
+        let created = handle_rlm_heartbeat_host_request(
+            "rlm_heartbeat.create",
+            &json!({ "instruction": "tick" }),
+            &store,
+            "live-1",
+            &binding(),
+        )
+        .unwrap();
+        let updated = handle_rlm_heartbeat_host_request(
+            "rlm_heartbeat.update",
+            &json!({ "id": created.response["heartbeat"]["id"], "interval": interval }),
+            &store,
+            "live-1",
+            &binding(),
+        )
+        .unwrap_or_else(|error| panic!("update with interval {interval:?}: {error}"));
+        updated.response["heartbeat"]["schedule"].clone()
+    }
+
+    /// The kernel skill documents `interval="5m"`: a bare `<n><unit>` is the
+    /// `every <n><unit>` interval, as 0.9.8 and `/heartbeat` read it.
+    #[test]
+    fn rlm_heartbeat_takes_a_bare_interval() {
+        assert_eq!(
+            created_schedule("5m"),
+            json!({ "kind": "interval", "expression": "every 5m", "intervalMs": 300_000 })
+        );
+        assert_eq!(
+            created_schedule("12h"),
+            json!({ "kind": "interval", "expression": "every 12h", "intervalMs": 43_200_000 })
+        );
+        assert_eq!(
+            updated_schedule("30 min"),
+            json!({ "kind": "interval", "expression": "every 30 min", "intervalMs": 1_800_000 })
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn a_bare_interval_schedules_as_its_every_form(
+            amount in 1_u64..=500,
+            unit in proptest::sample::select(vec!["m", "min", "minutes", "h", "hr", "hours", "d", "days"]),
+            spaced in proptest::bool::ANY,
+        ) {
+            let bare = if spaced { format!("{amount} {unit}") } else { format!("{amount}{unit}") };
+            let every = format!("every {bare}");
+            proptest::prop_assert_eq!(created_schedule(&bare), created_schedule(&every));
+            proptest::prop_assert_eq!(updated_schedule(&bare), updated_schedule(&every));
+        }
+    }
 }
