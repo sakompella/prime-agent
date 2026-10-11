@@ -233,19 +233,21 @@ pub fn kernel_provisioner(
                 .to_string(),
         ),
     ]);
-    if let Some(artifact_dir) = &session_artifact_dir {
-        env.insert(
-            "RLM_SESSION_DIR".to_string(),
+    // An ephemeral session has no local store. Empty values read as unset in
+    // the runtime, so its local writes fail instead of landing in harness dirs
+    // inherited from the process env (a run launched from another kernel).
+    let (session_dir, local_harness_dir) = match &session_artifact_dir {
+        Some(artifact_dir) => (
             artifact_dir.to_string_lossy().to_string(),
-        );
-        env.insert(
-            "RLM_HARNESS_STATE_DIR".to_string(),
             artifact_dir
                 .join(crate::refinement::HARNESS_STATE_DIR_NAME)
                 .to_string_lossy()
                 .to_string(),
-        );
-    }
+        ),
+        None => (String::new(), String::new()),
+    };
+    env.insert("RLM_SESSION_DIR".to_string(), session_dir);
+    env.insert("RLM_HARNESS_STATE_DIR".to_string(), local_harness_dir);
     Arc::new(KernelProvisioner::new(
         cwd,
         IpythonKernelProvisionerOptions {
