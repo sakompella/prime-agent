@@ -308,6 +308,30 @@ fn rpc_navigate_tree_rolls_the_session_back_in_place() {
     assert_eq!(after["data"]["sessionFile"], before["data"]["sessionFile"]);
 }
 
+/// A rollback survives the client ending and a later `--resume` of the same
+/// file, the way T3 reopens a thread.
+#[test]
+fn rpc_navigate_tree_survives_a_resume() {
+    let mut client = two_turn_session();
+    let navigated = roll_back_the_second_turn(&mut client);
+    assert_eq!(navigated["success"], true, "{navigated}");
+    let state = client.request(&json!({ "type": "get_state" }));
+    let session_file = state["data"]["sessionFile"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the session file: {state}"))
+        .to_string();
+    client.close_stdin();
+    assert!(client.wait_closed().success());
+    let mut resumed = client.join(
+        "resumed-script.json",
+        &["--mode", "rpc", "--resume", &session_file],
+        &json!({ "engine": "faux", "responses": [] }),
+        |_, _| {},
+    );
+    assert_eq!(conversation_texts(&mut resumed), vec!["first turn", "one"]);
+    assert_eq!(fork_message_texts(&mut resumed), vec!["first turn"]);
+}
+
 /// T3 baselines its turns on `get_fork_messages`: after a rollback it lists
 /// only the active branch's user entries, not the abandoned one.
 #[test]
