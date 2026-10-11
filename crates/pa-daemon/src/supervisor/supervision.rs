@@ -59,11 +59,20 @@ pub(crate) struct SpawnedWorker {
 /// never survives: a client may itself run inside an agent (its env
 /// carries the recursion marker), and a worker that inherited it would
 /// stamp every root session it creates with a stale depth (audit #9).
+/// The inherited session-scoped vars (`launch_env::is_session_scoped`)
+/// are removed first: they belong to whichever client started the
+/// daemon, so a worker sees only its own session's T3 connection.
 fn apply_worker_env(
     command: &mut Command,
+    inherited_keys: impl IntoIterator<Item = std::ffi::OsString>,
     client_launch_env: Option<&std::collections::BTreeMap<String, String>>,
     internal_launch_env: std::collections::BTreeMap<String, String>,
 ) {
+    for key in inherited_keys {
+        if pa_types::daemon::launch_env::is_session_scoped(&key.to_string_lossy()) {
+            command.env_remove(key);
+        }
+    }
     if let Some(env) = client_launch_env {
         command.envs(env);
     }
@@ -582,7 +591,12 @@ impl Supervisor {
             .clone();
         let mut command = Command::new(&executable);
         command.arg("worker");
-        apply_worker_env(&mut command, client_launch_env.as_ref(), launch_env);
+        apply_worker_env(
+            &mut command,
+            std::env::vars_os().map(|(key, _)| key),
+            client_launch_env.as_ref(),
+            launch_env,
+        );
         command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -1042,7 +1056,7 @@ mod tests {
             "internal-token".to_string(),
         )]);
         let mut command = Command::new("x");
-        apply_worker_env(&mut command, Some(&client), internal);
+        apply_worker_env(&mut command, [], Some(&client), internal);
         let envs: std::collections::BTreeMap<&std::ffi::OsStr, Option<&std::ffi::OsStr>> =
             command.as_std().get_envs().collect();
         assert_eq!(
@@ -1082,7 +1096,7 @@ mod tests {
             "1".to_string(),
         )]);
         let mut command = Command::new("x");
-        apply_worker_env(&mut command, None, internal);
+        apply_worker_env(&mut command, [], None, internal);
         let envs: std::collections::BTreeMap<&std::ffi::OsStr, Option<&std::ffi::OsStr>> =
             command.as_std().get_envs().collect();
         assert_eq!(
@@ -1094,6 +1108,40 @@ mod tests {
             envs.get(std::ffi::OsStr::new(crate::worker::WORKER_ROLE_ENV)),
             Some(&Some(std::ffi::OsStr::new("1"))),
             "the internal identity still rides"
+        );
+    }
+
+    /// A worker gets its session's T3 env instead of the supervisor's:
+    /// inherited session-scoped vars are removed, the client's ride.
+    #[test]
+    fn a_worker_gets_its_sessions_t3_env_instead_of_the_supervisors() {
+        let client = std::collections::BTreeMap::from([
+            ("T3_MCP_URL".to_string(), "http://fresh".to_string()),
+            ("PATH".to_string(), "/client/bin".to_string()),
+        ]);
+        let mut command = Command::new("x");
+        apply_worker_env(
+            &mut command,
+            ["T3_STALE", "T3_MCP_URL", "PATH"].map(std::ffi::OsString::from),
+            Some(&client),
+            std::collections::BTreeMap::new(),
+        );
+        let envs: std::collections::BTreeMap<&std::ffi::OsStr, Option<&std::ffi::OsStr>> =
+            command.as_std().get_envs().collect();
+        assert_eq!(
+            envs,
+            std::collections::BTreeMap::from([
+                (
+                    std::ffi::OsStr::new("PATH"),
+                    Some(std::ffi::OsStr::new("/client/bin"))
+                ),
+                (std::ffi::OsStr::new("RLM_DEPTH"), None),
+                (
+                    std::ffi::OsStr::new("T3_MCP_URL"),
+                    Some(std::ffi::OsStr::new("http://fresh"))
+                ),
+                (std::ffi::OsStr::new("T3_STALE"), None),
+            ])
         );
     }
 }

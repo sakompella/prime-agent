@@ -212,7 +212,16 @@ impl Supervisor {
                     return Err(anyhow!(rejection));
                 }
                 match self.reuse_summary_or_holder(resident, &path_text).await? {
-                    ReuseAnswer::Summary(summary) => return Ok(Some(summary)),
+                    ReuseAnswer::Summary(summary) => {
+                        if let DaemonCommand::Create {
+                            launch_env: Some(launch_env),
+                            ..
+                        } = command
+                        {
+                            resident.rebind_session_env(launch_env);
+                        }
+                        return Ok(Some(summary));
+                    }
                     // The routed resident went away with no successor: its teardown must
                     // settle, then the fresh classification re-checks the file (including any
                     // waitable successor).
