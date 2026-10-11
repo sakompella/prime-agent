@@ -196,11 +196,12 @@ if _PRIME_AGENT_SKILL_IMPORT_ERRORS:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::T3Code;
     use std::path::PathBuf;
 
     #[test]
     fn bootstrap_code_without_skills_binds_rlm() {
-        let code = build_rlm_bootstrap_code(&[], false);
+        let code = build_rlm_bootstrap_code(&[], false, T3Code::Absent);
         assert!(code.contains("import rlm as _prime_agent_rlm_module"));
         assert!(!code.contains("_PrimeAgentUnavailableSkill"));
     }
@@ -227,9 +228,57 @@ mod tests {
             package_path: PathBuf::from("/pkg/edit"),
             pyproject_path: PathBuf::from("/pkg/edit/pyproject.toml"),
         }];
-        let code = build_rlm_bootstrap_code(&skills, false);
+        let code = build_rlm_bootstrap_code(&skills, false, T3Code::Absent);
         assert!(code.contains(r#"for _prime_agent_skill_name in ["edit"]"#));
         assert!(code.contains("_PrimeAgentUnavailableSkill"));
+    }
+
+    #[test]
+    fn bootstrap_code_imports_t3_only_in_t3_sessions() {
+        for (t3_code, imports_t3) in [(T3Code::Absent, false), (T3Code::Present, true)] {
+            let code = build_rlm_bootstrap_code(&[], false, t3_code);
+            assert_eq!(
+                code.contains("import rlm.t3 as t3"),
+                imports_t3,
+                "{t3_code:?}"
+            );
+        }
+    }
+
+    /// A broken `rlm.t3` must not abort the bootstrap cell: `t3` becomes a
+    /// stub whose attributes raise the import error.
+    #[test]
+    fn a_failing_t3_import_binds_a_stub_that_names_the_error() {
+        let runtime = tempfile::tempdir().expect("temp dir");
+        let package = runtime.path().join("rlm");
+        std::fs::create_dir_all(&package).expect("package dir");
+        std::fs::write(package.join("__init__.py"), "rlm = None\nbash = None\n")
+            .expect("rlm package");
+        std::fs::write(package.join("mcp.py"), "").expect("rlm.mcp");
+        std::fs::write(package.join("t3.py"), "raise ImportError('t3 is broken')\n")
+            .expect("rlm.t3");
+        let code = format!(
+            "{}\ntry:\n    t3.project_list\nexcept RuntimeError as error:\n    print(error)\n",
+            build_rlm_bootstrap_code(&[], false, T3Code::Present)
+        );
+        let output = match std::process::Command::new("python3")
+            .args(["-c", &code])
+            .env("PYTHONPATH", runtime.path())
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("python3 unavailable ({error}); skipping");
+                return;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("t3 is broken"), "{stdout}");
     }
 
     /// The TS #2381 parser table: marker+JSON, noise-prefixed marker, no marker, non-JSON payload
