@@ -1,7 +1,6 @@
 //! Parsing of ipython execution `details` for the cell card: the
 //! details record, the background-shell handle repr, literal shell
-//! launches, and the edit-confirmation and agent-message-receipt
-//! suppressions.
+//! launches, and the agent-message-receipt suppression.
 
 use serde_json::Value;
 
@@ -15,7 +14,6 @@ pub(crate) struct IpythonDetails {
     pub(crate) result: Option<String>,
     pub(crate) background_output: Option<String>,
     pub(crate) error: Option<IpythonError>,
-    pub(crate) diffs: Vec<Value>,
     pub(crate) sent_agent_messages: Vec<Value>,
     pub(crate) bash_commands: Option<BashCommands>,
 }
@@ -83,7 +81,6 @@ impl IpythonDetails {
             result: None,
             background_output: None,
             error: None,
-            diffs: Vec::new(),
             sent_agent_messages: Vec::new(),
             bash_commands: None,
         };
@@ -120,11 +117,6 @@ impl IpythonDetails {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             error,
-            diffs: record
-                .get("diffs")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
             sent_agent_messages: record
                 .get("sentAgentMessages")
                 .and_then(Value::as_array)
@@ -156,20 +148,6 @@ pub(crate) fn strip_repr_quotes(text: &str) -> &str {
     } else {
         trimmed
     }
-}
-
-/// True when `text` is the edit skill's "Edited <path>" confirmation for one
-/// of the cell's diffs (TS `isEditConfirmation`).
-pub(crate) fn is_edit_confirmation(text: Option<&str>, diffs: &[Value]) -> bool {
-    let Some(text) = text else {
-        return false;
-    };
-    let stripped = strip_repr_quotes(text);
-    diffs.iter().any(|diff| {
-        diff.get("path")
-            .and_then(Value::as_str)
-            .is_some_and(|path| stripped == format!("Edited {path}"))
-    })
 }
 
 /// One parsed sent agent message (TS `SentAgentMessageDisplay`): the

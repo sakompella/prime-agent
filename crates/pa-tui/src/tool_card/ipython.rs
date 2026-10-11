@@ -9,8 +9,8 @@ use output::render_output;
 use serde_json::Value;
 
 use super::ipython_details::{
-    format_duration, is_agent_message_receipt, is_edit_confirmation, parse_sent_agent_message,
-    read_background_shell, BackgroundShell, BashCommands, IpythonDetails, IpythonError,
+    format_duration, is_agent_message_receipt, parse_sent_agent_message, read_background_shell,
+    BackgroundShell, BashCommands, IpythonDetails, IpythonError,
 };
 use super::layout::RowOutput;
 use super::{highlight, ToolCallCard};
@@ -64,7 +64,6 @@ impl CardStatus {
                 || details.stderr.is_some()
                 || details.result.is_some()
                 || details.error.is_some()
-                || !details.diffs.is_empty()
                 || !details.sent_agent_messages.is_empty()
                 || !r.content.is_empty()
         });
@@ -307,11 +306,9 @@ pub(crate) fn bash_dominated_stats(card: &ToolCallCard) -> Option<BashCellStats>
 }
 
 /// `\u{2191}in \u{2193}out lines` (TS `lineCounts`): non-empty input
-/// lines; output from the structured fields (edits show the diff, so
-/// count zero).
+/// lines; output from the structured fields.
 fn line_counts(card: &ToolCallCard, details: &IpythonDetails, code: &str) -> Option<String> {
     let input = input_line_count(code);
-    let has_diffs = !details.diffs.is_empty();
 
     let result =
         if is_agent_message_receipt(details.result.as_deref(), &details.sent_agent_messages) {
@@ -342,7 +339,7 @@ fn line_counts(card: &ToolCallCard, details: &IpythonDetails, code: &str) -> Opt
     } else {
         structured
     };
-    let output = if has_diffs || output_text.trim().is_empty() {
+    let output = if output_text.trim().is_empty() {
         0
     } else {
         output_text.trim().lines().count()
