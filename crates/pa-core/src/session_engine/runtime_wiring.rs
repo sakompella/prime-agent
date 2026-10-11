@@ -234,7 +234,8 @@ pub fn kernel_python_skills(skills: &[Skill]) -> Vec<KernelPythonSkill> {
 /// Build the kernel provisioner for a session: host handlers for the goal/heartbeat bridge
 /// plus the pre-imported skills. The session's agent dir is propagated into the kernel env
 /// (`PRIME_AGENT_CODING_AGENT_DIR`): an embedding host whose ambient env differs must not
-/// leak its own paths into the kernel (#109). A persistent session's artifact dir is
+/// leak its own paths into the kernel (#109), and the global harness store is the agent
+/// dir's (`RLM_GLOBAL_HARNESS_STATE_DIR`). A persistent session's artifact dir is
 /// likewise propagated (`RLM_SESSION_DIR` + `RLM_HARNESS_STATE_DIR`), so kernel-side
 /// harness writes land in the session-local store. The artifact dir is keyed by the
 /// durable session id (the session file's stem), exported as `RLM_SESSION_ID` for the
@@ -259,10 +260,16 @@ pub fn kernel_provisioner(
     on_unavailable_skills: Option<crate::kernel::provisioner::UnavailableSkillsCallback>,
     on_bootstrap_result: Option<crate::kernel::provisioner::KernelBootstrapResultHandler>,
 ) -> Arc<KernelProvisioner> {
-    let mut env = HashMap::with_capacity(3);
+    let mut env = HashMap::with_capacity(5);
     env.insert(
         "PRIME_AGENT_CODING_AGENT_DIR".to_string(),
         agent_dir.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "RLM_GLOBAL_HARNESS_STATE_DIR".to_string(),
+        crate::refinement::get_global_harness_state_dir(agent_dir)
+            .to_string_lossy()
+            .to_string(),
     );
     // Always set: an unsaved session blanks an inherited id (a run started inside another
     // session's kernel), so its persistent shells never join that session.
