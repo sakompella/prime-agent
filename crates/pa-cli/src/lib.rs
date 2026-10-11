@@ -106,6 +106,13 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
     if args.len() == 1 && args[0] == "--prime-agent-bootstrap" {
         return run_runtime_bootstrap();
     }
+    if args.len() == 1 && args[0] == "--capabilities" {
+        println!(
+            "{}",
+            pa_daemon::rpc::daemon::t3_fork_capabilities(crate::config::version())
+        );
+        return Ok(0);
+    }
 
     // Public command routing: help requests, removed commands, management
     // commands, and the model/session rewrites.
