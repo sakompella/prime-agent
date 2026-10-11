@@ -76,4 +76,5 @@ pub mod skills;
 pub mod slash_command_args;
 pub mod update;
 pub mod workspace_snapshot;
+mod t3_code;
 pub use kernel::ReplKernelManager;

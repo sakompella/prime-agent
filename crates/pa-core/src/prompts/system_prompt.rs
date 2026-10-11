@@ -397,6 +397,7 @@ fn format_generic_mcp_guidance(servers: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::skills::{create_synthetic_source_info, SkillKind, SourceScope};
+    use crate::T3Code;
     use std::path::PathBuf;
 
     fn skill(name: &str, import: Option<&str>) -> Skill {
@@ -520,6 +521,37 @@ mod tests {
         assert!(breakdown
             .assembled
             .contains("# Additional Guidance\n\n- be careful"));
+    }
+
+    #[test]
+    fn t3_sessions_point_at_the_t3_module_instead_of_the_t3_code_server() {
+        let cases = [
+            (T3Code::Absent, "Enabled generic MCP servers: `slack`, `t3-code`."),
+            (T3Code::Present, "Enabled generic MCP servers: `slack`."),
+        ];
+        for (t3_code, generic_line) in cases {
+            let mut options = base_options();
+            options.generic_mcp_servers = vec!["t3-code".to_string(), "slack".to_string()];
+            options.t3_code = t3_code;
+            let prompt = build_system_prompt(&options);
+            let present = t3_code == T3Code::Present;
+            assert_eq!(prompt.contains("# T3 Code\n"), present, "{t3_code:?}");
+            assert_eq!(prompt.contains("`help(t3)`"), present, "{t3_code:?}");
+            assert_eq!(prompt.contains("`t3-code`"), !present, "{t3_code:?}");
+            assert!(prompt.contains(generic_line), "{t3_code:?}");
+        }
+
+        let mut only_t3 = base_options();
+        only_t3.generic_mcp_servers = vec!["t3-code".to_string()];
+        only_t3.t3_code = T3Code::Present;
+        let prompt = build_system_prompt(&only_t3);
+        assert!(prompt.contains("# T3 Code\n"));
+        assert!(!prompt.contains("# Generic MCP Connections"));
+
+        let mut no_kernel = base_options();
+        no_kernel.t3_code = T3Code::Present;
+        no_kernel.selected_tools = Some(vec!["bash"]);
+        assert!(!build_system_prompt(&no_kernel).contains("# T3 Code"));
     }
 
     #[test]
