@@ -403,3 +403,38 @@ fn bash_minority_cell_stays_python() {
     );
     assert_eq!(bash_dominated_stats(&card), None);
 }
+
+/// The TUI has no diff renderer, so a cell's `details.diffs` must not hide the
+/// edit skill's "Edited <path>" receipt or the output line count it feeds.
+#[test]
+fn edit_receipt_survives_forwarded_diffs() {
+    let code = "await edit(path=filename, old_str=before, new_str=after)";
+    for receipt_field in ["result", "stdout"] {
+        let mut details = json!({ "status": "ok", "durationMs": 2 });
+        details[receipt_field] = json!("'Edited /tmp/notes.txt'");
+        let render_all = |details: Value| -> Vec<String> {
+            let card = cell_card(code, details, false, false);
+            render(&card, 0, Detail::All, &theme(), 120, true)
+                .iter()
+                .map(text_of)
+                .collect()
+        };
+        let without_diffs = render_all(details.clone());
+        details["diffs"] = json!([
+            { "path": "/tmp/notes.txt", "oldStr": "alpha", "newStr": "ALPHA", "startLine": 2 }
+        ]);
+        let with_diffs = render_all(details);
+
+        assert_eq!(with_diffs, without_diffs, "{receipt_field}");
+        assert!(
+            with_diffs[0].contains("\u{2191} 1 \u{2193} 1 lines"),
+            "{receipt_field}: {with_diffs:?}"
+        );
+        assert!(
+            with_diffs
+                .iter()
+                .any(|line| line.contains("Edited /tmp/notes.txt")),
+            "{receipt_field}: {with_diffs:?}"
+        );
+    }
+}
