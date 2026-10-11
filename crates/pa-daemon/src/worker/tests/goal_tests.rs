@@ -433,6 +433,32 @@ fn thread_goal_state_rows(path: &std::path::Path) -> Vec<Value> {
         .collect()
 }
 
+/// A seeded goal that cannot reach the session file is not announced; an
+/// in-memory session records it without a file.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_started_goal_is_announced_only_once_its_row_is_durable() {
+    use std::os::unix::fs::PermissionsExt;
+    let started = json!({ "active": true, "status": "active", "objective": "durable goal" });
+    let (worker, file) = goal_dispatch_worker_with_store(Value::Null).await;
+    let mut subscription = worker.events.subscribe();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let refused = worker.persist_started_goal(&started);
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(refused.is_err(), "a read-only session file refuses the row");
+    assert_eq!(thread_goal_state_rows(&file), Vec::<Value>::new());
+    assert_eq!(session_events_since(&mut subscription), Vec::<Value>::new());
+
+    worker.persist_started_goal(&started).unwrap();
+    assert_eq!(thread_goal_state_rows(&file).len(), 1);
+    let announced = session_events_since(&mut subscription);
+    assert_eq!(announced.len(), 1, "{announced:?}");
+    assert_eq!(announced[0]["goal"], started);
+
+    let in_memory = goal_dispatch_worker(Value::Null).await;
+    in_memory.persist_started_goal(&started).unwrap();
+}
+
 /// The mirror row is what a recovery rebuild replays.
 #[tokio::test]
 async fn goal_update_events_mirror_the_durable_goal_row() {

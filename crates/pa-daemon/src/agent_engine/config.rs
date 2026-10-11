@@ -90,6 +90,17 @@ pub(crate) struct CreateSessionResources {
     /// The creating client's mode (`interactive`, `acp`, ...) for the
     /// session's telemetry; absent reports `unknown` (TS parity).
     pub(crate) execution_mode: Option<String>,
+    /// The CLI `--goal` seed; the create consumes it once (it never reaches a build).
+    pub(crate) initial_goal: Option<InitialGoal>,
+}
+
+/// The create's `--goal` objective (TS `initialGoal`): a depth-0 session on a
+/// seedable branch starts it.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InitialGoal {
+    pub(crate) objective: String,
+    pub(crate) token_budget: Option<u64>,
 }
 
 /// The create command's `--models` scope inputs: the startup chain picks
