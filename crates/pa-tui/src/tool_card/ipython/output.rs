@@ -1,8 +1,8 @@
 //! Expanded cell output; painting and counting share the same output decisions.
 
 use super::{
-    add_wrapped, is_agent_message_receipt, is_edit_confirmation, normalize_error_details,
-    str_width, summarize_error_details, IpythonDetails, IpythonError, Line, RowOutput, Span, Theme,
+    add_wrapped, is_agent_message_receipt, normalize_error_details, str_width,
+    summarize_error_details, IpythonDetails, IpythonError, Line, RowOutput, Span, Theme,
     ThemeColor, ToolCallCard, Value, OUTPUT_INDENT,
 };
 
@@ -119,7 +119,6 @@ pub(super) fn render_output(
             .stdout
             .as_deref()
             .is_some_and(|s| !s.trim().is_empty())
-            && !is_edit_confirmation(details.stdout.as_deref(), &details.diffs)
         {
             start_output(&mut output_started, lines);
             rendered_text_output = true;
@@ -150,12 +149,7 @@ pub(super) fn render_output(
         }
         let result_text = details.result.as_deref().filter(|s| !s.trim().is_empty());
         if let Some(result) = result_text {
-            if !is_edit_confirmation(details.result.as_deref(), &details.diffs)
-                && !is_agent_message_receipt(
-                    details.result.as_deref(),
-                    &details.sent_agent_messages,
-                )
-            {
+            if !is_agent_message_receipt(details.result.as_deref(), &details.sent_agent_messages) {
                 start_output(&mut output_started, lines);
                 rendered_text_output = true;
                 render_output_text(
@@ -230,7 +224,6 @@ pub(super) fn render_output(
     } else if !rendered_text_output
         && traceback.is_none()
         && details.error.is_none()
-        && details.diffs.is_empty()
         && details.sent_agent_messages.is_empty()
         && card.started
         && image_count == 0
