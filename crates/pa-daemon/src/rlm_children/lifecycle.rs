@@ -10,6 +10,7 @@ use super::{
     RUNTIME_METADATA_PROMPT_MAX, STATE_TIMEOUT_MS, WATCH_MAX_UNREACHABLE_POLLS,
     WATCH_POLL_INTERVAL_MS, WATCH_SETTLE_GRACE_MS, WATCH_WAIT_SLICE_MS,
 };
+use pa_types::daemon::launch_env::SessionEnv;
 
 /// Parsed ids of one created child session.
 struct CreatedSessionIds {
@@ -135,7 +136,9 @@ impl SupervisorChildSessionsInner {
             runtime_metadata,
             lifecycle: Some(DaemonSessionLifecycle::Resident),
             env: None,
-            launch_env: None,
+            // The supervisor scoped this worker's env to its session, so the
+            // process env is exactly the parent's forwarded env.
+            launch_env: SessionEnv::collect(std::env::vars_os()).into_wire(),
             rest: Map::default(),
         };
         let summary = self
