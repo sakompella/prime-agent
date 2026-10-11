@@ -247,6 +247,75 @@ fn rpc_observe_streams_a_child_session() {
     );
 }
 
+/// `rlm.collect` with a timeout, right after `rlm.spawn`, blocks until the
+/// child settles: it answers `done` with the child's reply, not a `running`
+/// snapshot of a child whose task has not started yet.
+#[test]
+fn rpc_collect_right_after_spawn_waits_for_the_child() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let collect_cell = "handle = await rlm.spawn(\"run the lane task\", name=\"kid\")\n[result] = await rlm.collect(handle, timeout_ms=120000)\nprint(result.status, result.answer_preview)";
+    let parent_script = json!({ "engine": "faux", "responses": [
+        ipython_call(collect_cell),
+        { "text": "collect turn done" },
+        { "text": "notice seen" },
+    ] });
+    let gate = std::cell::OnceCell::new();
+    let mut client = RpcChild::spawn_configured(
+        &["--mode", "rpc"],
+        &parent_script,
+        |home, command| {
+            let gate_path = home.join("release-child");
+            let hold = format!(
+                "import asyncio, os\nwhile not os.path.exists({:?}):\n    await asyncio.sleep(0.05)",
+                gate_path.display().to_string()
+            );
+            let child_script = json!({ "engine": "faux", "responses": [
+                ipython_call(&hold),
+                { "text": "kid done" },
+            ] });
+            let child_script_path = home.join("child-script.json");
+            std::fs::write(&child_script_path, child_script.to_string()).unwrap();
+            command
+                .env("PRIME_AGENT_FAUX_CHILD_SCRIPT", &child_script_path)
+                .env("PRIME_AGENT_KERNEL_PYTHON", &kernel_python);
+            gate.set(gate_path).unwrap();
+        },
+    );
+    let response = client.request(&json!({ "type": "prompt", "message": "spawn and collect" }));
+    assert_eq!(response["success"], true, "{response}");
+    let (running, _) = client.wait_frame(|frame| {
+        frame["type"] == "rlm_child_update"
+            && frame["child"]["status"] == "running"
+            && frame["child"]["activeSessionId"].is_string()
+    });
+    let child_session = running["child"]["activeSessionId"].clone();
+    let observed = client.request(&json!({ "type": "observe", "activeSessionId": child_session }));
+    assert_eq!(observed["success"], true, "{observed}");
+    let is_parent_tool_result =
+        |frame: &Value| frame["type"] == "message_end" && frame["message"]["role"] == "toolResult";
+    let (_, before_child_cell) = client.wait_frame(|frame| {
+        frame["type"] == "observed_session_event"
+            && frame["activeSessionId"] == child_session
+            && frame["event"]["type"] == "tool_execution_start"
+    });
+    let early = before_child_cell
+        .iter()
+        .find(|frame| is_parent_tool_result(frame));
+    assert!(
+        early.is_none(),
+        "collect answered before the child's task ran: {early:?}"
+    );
+    std::fs::write(gate.get().expect("the gate path"), "").unwrap();
+    let (result, _) = client.wait_frame(is_parent_tool_result);
+    assert_eq!(
+        first_text(&result["message"]).trim(),
+        "done kid done",
+        "{result}"
+    );
+}
+
 /// A session that ran the turns "first turn" and "second turn".
 fn two_turn_session() -> RpcChild {
     let mut client = RpcChild::spawn(
