@@ -285,14 +285,20 @@ struct Output {
     /// `Some` while a `prompt` response is pending: the session events wait
     /// here and follow the response (TS `promptResponsePending`).
     prompt_buffer: Option<Vec<Value>>,
-    /// By the id the client observed.
-    observed: HashMap<String, Observation>,
-    /// A rebound observed session's current daemon id -> the id the client
-    /// observed (its frames keep reporting that id).
-    rebound: HashMap<String, String>,
+    /// By the id the client observed; frames keep reporting that id.
+    observed: HashMap<String, Observed>,
 }
 
-/// One observed session, by the state of its `observe` response.
+/// One observed session.
+struct Observed {
+    /// The daemon id the session streams under now. Only frames from this
+    /// id reach the observation: a rebind moves it, and the superseded ids'
+    /// late frames match nothing.
+    current: String,
+    state: Observation,
+}
+
+/// An observed session, by the state of its `observe` response.
 enum Observation {
     /// The response is not written yet: the session's frames wait here.
     Pending {
@@ -303,12 +309,45 @@ enum Observation {
 }
 
 impl Output {
-    /// The daemon id an observed session streams under now.
-    fn daemon_session_of(&self, observed_id: &str) -> String {
-        self.rebound
+    /// The observed id of the session streaming under `current` now.
+    fn observed_id_of(&self, current: &str) -> Option<String> {
+        self.observed
             .iter()
-            .find(|(_, observed)| observed.as_str() == observed_id)
-            .map_or_else(|| observed_id.to_string(), |(daemon, _)| daemon.clone())
+            .find(|(_, observed)| observed.current == current)
+            .map(|(observed_id, _)| observed_id.clone())
+    }
+
+    /// Publish an observed session's close and retire it: at once when
+    /// live, after the `observe` response when it is still pending.
+    fn close_observed(&mut self, writer: &LineWriter, observed_id: &str, error: &str) {
+        let frame = json!({
+            "type": "observed_session_closed",
+            "activeSessionId": observed_id,
+            "error": error,
+        });
+        match self.observed.remove(observed_id) {
+            Some(Observed {
+                state: Observation::Live,
+                ..
+            }) => self.emit(writer, frame),
+            Some(Observed {
+                current,
+                state: Observation::Pending { mut frames, .. },
+            }) => {
+                frames.push(frame);
+                self.observed.insert(
+                    observed_id.to_string(),
+                    Observed {
+                        current,
+                        state: Observation::Pending {
+                            frames,
+                            closed: true,
+                        },
+                    },
+                );
+            }
+            None => {}
+        }
     }
 
     fn emit(&mut self, writer: &LineWriter, frame: Value) {
@@ -324,6 +363,8 @@ struct RpcConnection {
     writer: LineWriter,
     binding: Mutex<Binding>,
     output: Mutex<Output>,
+    /// What ends the process from outside the stdin loop.
+    interrupts: tokio::sync::mpsc::UnboundedSender<Interrupt>,
 }
 
 impl RpcConnection {
@@ -365,17 +406,19 @@ impl RpcConnection {
             let target = command.payload["activeSessionId"]
                 .as_str()
                 .unwrap_or_default();
-            if let Some(Observation::Pending { frames, closed }) = output.observed.get_mut(target) {
+            if let Some(Observed {
+                state: Observation::Pending { frames, closed },
+                ..
+            }) = output.observed.get_mut(target)
+            {
                 let (frames, closed) = (std::mem::take(frames), *closed);
                 for frame in frames {
                     output.emit(&self.writer, frame);
                 }
                 if closed {
                     output.observed.remove(target);
-                } else {
-                    output
-                        .observed
-                        .insert(target.to_string(), Observation::Live);
+                } else if let Some(observed) = output.observed.get_mut(target) {
+                    observed.state = Observation::Live;
                 }
             }
         }
@@ -472,9 +515,12 @@ impl RpcConnection {
                     // from the attach on wait for the response.
                     self.output.lock().unwrap().observed.insert(
                         target.to_string(),
-                        Observation::Pending {
-                            frames: Vec::new(),
-                            closed: false,
+                        Observed {
+                            current: target.to_string(),
+                            state: Observation::Pending {
+                                frames: Vec::new(),
+                                closed: false,
+                            },
                         },
                     );
                     self.send(json!({ "type": "attach", "activeSessionId": target }))
@@ -484,8 +530,17 @@ impl RpcConnection {
                 };
                 let messages = match attached {
                     Ok(()) => {
-                        let streaming = self.output.lock().unwrap().daemon_session_of(target);
-                        self.send(json!({ "type": "get_messages", "activeSessionId": streaming }))
+                        let current = self
+                            .output
+                            .lock()
+                            .unwrap()
+                            .observed
+                            .get(target)
+                            .map_or_else(
+                                || target.to_string(),
+                                |observed| observed.current.clone(),
+                            );
+                        self.send(json!({ "type": "get_messages", "activeSessionId": current }))
                             .await
                     }
                     Err(error) => Err(error),
@@ -500,15 +555,10 @@ impl RpcConnection {
             }
             RpcRoute::Unobserve => {
                 let target = payload["activeSessionId"].as_str().unwrap_or_default();
-                let streaming = {
-                    let mut output = self.output.lock().unwrap();
-                    let streaming = output.daemon_session_of(target);
-                    output.rebound.remove(&streaming);
-                    output.observed.remove(target).map(|_| streaming)
-                };
-                if let Some(streaming) = streaming {
+                let observed = self.output.lock().unwrap().observed.remove(target);
+                if let Some(observed) = observed {
                     let _ = self
-                        .send(json!({ "type": "detach", "activeSessionId": streaming }))
+                        .send(json!({ "type": "detach", "activeSessionId": observed.current }))
                         .await;
                 }
                 Ok(ResponseData::Absent)
@@ -589,27 +639,22 @@ impl RpcConnection {
                     output.emit(&self.writer, event);
                     return None;
                 }
-                let observed_id = output
-                    .rebound
-                    .get(&active_session_id)
-                    .cloned()
-                    .unwrap_or(active_session_id);
-                let live = match output.observed.get(&observed_id) {
-                    Some(Observation::Live) => true,
-                    Some(Observation::Pending { .. }) => false,
-                    None => return None,
-                };
+                let observed_id = output.observed_id_of(&active_session_id)?;
                 let frame = json!({
                     "type": "observed_session_event",
                     "activeSessionId": observed_id,
                     "event": event,
                 });
-                if live {
-                    output.emit(&self.writer, frame);
-                } else if let Some(Observation::Pending { frames, .. }) =
-                    output.observed.get_mut(&observed_id)
-                {
-                    frames.push(frame);
+                match output.observed.get_mut(&observed_id) {
+                    Some(Observed {
+                        state: Observation::Pending { frames, .. },
+                        ..
+                    }) => frames.push(frame),
+                    Some(Observed {
+                        state: Observation::Live,
+                        ..
+                    }) => output.emit(&self.writer, frame),
+                    None => {}
                 }
                 None
             }
@@ -637,35 +682,16 @@ impl RpcConnection {
                     return (!completing).then(|| Interrupt::Lost(error.to_string()));
                 }
                 let mut output = self.output.lock().unwrap();
-                let observed_id = output
-                    .rebound
-                    .remove(&active_session_id)
-                    .unwrap_or(active_session_id);
-                let frame = json!({
-                    "type": "observed_session_closed",
-                    "activeSessionId": observed_id,
-                    "error": error,
-                });
-                match output.observed.remove(&observed_id) {
-                    Some(Observation::Live) => output.emit(&self.writer, frame),
-                    Some(Observation::Pending { mut frames, .. }) => {
-                        frames.push(frame);
-                        output.observed.insert(
-                            observed_id,
-                            Observation::Pending {
-                                frames,
-                                closed: true,
-                            },
-                        );
-                    }
-                    None => {}
+                if let Some(observed_id) = output.observed_id_of(&active_session_id) {
+                    output.close_observed(&self.writer, &observed_id, error);
                 }
                 None
             }
             // A worker replacement moved a session to a new id. The routing
             // follows at once and the link attaches the new id in the
             // background (the supervisor does not move the subscription),
-            // like the TUI's rebind.
+            // like the TUI's rebind. A refused attach ends the stream it was
+            // for, unless a newer binding or an unobserve moved on since.
             LinkEvent::SessionBinding {
                 previous_active_session_id,
                 active_session_id,
@@ -680,24 +706,34 @@ impl RpcConnection {
                 };
                 let observed = {
                     let mut output = self.output.lock().unwrap();
-                    let observed_id = output
-                        .rebound
-                        .remove(&previous_active_session_id)
-                        .unwrap_or(previous_active_session_id);
-                    let observed = output.observed.contains_key(&observed_id);
-                    if observed {
-                        output
-                            .rebound
-                            .insert(active_session_id.clone(), observed_id);
+                    let observed_id = output.observed_id_of(&previous_active_session_id);
+                    if let Some(observed) = observed_id
+                        .as_ref()
+                        .and_then(|observed_id| output.observed.get_mut(observed_id))
+                    {
+                        observed.current.clone_from(&active_session_id);
                     }
-                    observed
+                    observed_id.is_some()
                 };
                 if bound || observed {
                     let connection = Arc::clone(self);
                     tokio::spawn(async move {
-                        let _ = connection
+                        let Err(refusal) = connection
                             .send(json!({ "type": "attach", "activeSessionId": active_session_id }))
-                            .await;
+                            .await
+                        else {
+                            return;
+                        };
+                        let error = format!(
+                            "The session moved to {active_session_id}, and attaching it failed: {refusal}"
+                        );
+                        if connection.active_session_id() == active_session_id {
+                            let _ = connection.interrupts.send(Interrupt::Lost(error.clone()));
+                        }
+                        let mut output = connection.output.lock().unwrap();
+                        if let Some(observed_id) = output.observed_id_of(&active_session_id) {
+                            output.close_observed(&connection.writer, &observed_id, &error);
+                        }
                     });
                 }
                 None
@@ -743,6 +779,7 @@ pub async fn run_daemon_attached_rpc_mode(options: DaemonRpcOptions) -> anyhow::
     };
     // An unspecified lifecycle is resident (the supervisor's reading).
     let lifecycle = lifecycle.unwrap_or(DaemonSessionLifecycle::Resident);
+    let (interrupts_tx, mut interrupts) = tokio::sync::mpsc::unbounded_channel::<Interrupt>();
     let connection = Arc::new(RpcConnection {
         link: Arc::clone(&link),
         writer: LineWriter::spawn(),
@@ -753,20 +790,19 @@ pub async fn run_daemon_attached_rpc_mode(options: DaemonRpcOptions) -> anyhow::
             daemon_closing: None,
         }),
         output: Mutex::new(Output::default()),
+        interrupts: interrupts_tx,
     });
-    let (interrupts_tx, mut interrupts) = tokio::sync::mpsc::unbounded_channel::<Interrupt>();
     {
         // The link answers requests only while its events are consumed,
         // so the consumer runs before the startup create.
         let connection = Arc::clone(&connection);
-        let interrupts_tx = interrupts_tx.clone();
         tokio::spawn(async move {
             while let Some(event) = connection.link.next_event().await {
                 if let Some(interrupt) = connection.route_event(event) {
-                    let _ = interrupts_tx.send(interrupt);
+                    let _ = connection.interrupts.send(interrupt);
                 }
             }
-            let _ = interrupts_tx.send(Interrupt::Lost(
+            let _ = connection.interrupts.send(Interrupt::Lost(
                 "Lost connection to the Prime Agent daemon.".to_string(),
             ));
         });
@@ -820,14 +856,13 @@ pub async fn run_daemon_attached_rpc_mode(options: DaemonRpcOptions) -> anyhow::
         (tokio::signal::unix::SignalKind::hangup(), 129),
     ] {
         let mut signals = tokio::signal::unix::signal(kind)?;
-        let interrupts_tx = interrupts_tx.clone();
+        let interrupts = connection.interrupts.clone();
         tokio::spawn(async move {
             if signals.recv().await.is_some() {
-                let _ = interrupts_tx.send(Interrupt::Signal { exit_code });
+                let _ = interrupts.send(Interrupt::Signal { exit_code });
             }
         });
     }
-    drop(interrupts_tx);
 
     let mut handlers = tokio::task::JoinSet::new();
     let mut lane_tails: HashMap<Lane, tokio::sync::oneshot::Receiver<()>> = HashMap::new();
@@ -919,7 +954,7 @@ mod tests {
         fn new(observed: &[&str]) -> Scripted {
             let (writer, commands) = tokio::sync::mpsc::unbounded_channel::<String>();
             let pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
-            let (_interrupts_tx, interrupts) = tokio::sync::mpsc::unbounded_channel();
+            let (interrupts_tx, interrupts) = tokio::sync::mpsc::unbounded_channel();
             let connection = Arc::new(RpcConnection {
                 link: Arc::new(DaemonLink::scripted(writer, Arc::clone(&pending))),
                 writer: LineWriter::spawn(),
@@ -933,10 +968,18 @@ mod tests {
                     prompt_buffer: Some(Vec::new()),
                     observed: observed
                         .iter()
-                        .map(|id| ((*id).to_string(), Observation::Live))
+                        .map(|id| {
+                            (
+                                (*id).to_string(),
+                                Observed {
+                                    current: (*id).to_string(),
+                                    state: Observation::Live,
+                                },
+                            )
+                        })
                         .collect(),
-                    rebound: HashMap::new(),
                 }),
+                interrupts: interrupts_tx,
             });
             Scripted {
                 connection,
