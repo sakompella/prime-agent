@@ -156,9 +156,28 @@ impl RpcChild {
         self.wait_frame(|frame| frame["type"] == event_type).0
     }
 
+    /// Send `command` and wait for its response, dropping the frames read
+    /// before it. A frame the command causes can race ahead of its response:
+    /// wait for those with [`RpcChild::request_and_wait`].
     pub fn request(&mut self, command: &Value) -> Value {
         let id = self.command(command);
         self.wait_response(&id).0
+    }
+
+    /// Send `command` and wait for its response and for one frame matching
+    /// `frame_matches`, which may arrive on either side of the response.
+    pub fn request_and_wait(
+        &mut self,
+        command: &Value,
+        mut frame_matches: impl FnMut(&Value) -> bool,
+    ) -> (Value, Value) {
+        let id = self.command(command);
+        let (response, before) = self.wait_response(&id);
+        if let Some(frame) = before.into_iter().find(|frame| frame_matches(frame)) {
+            return (response, frame);
+        }
+        let (frame, _) = self.wait_frame(frame_matches);
+        (response, frame)
     }
 
     /// Wait for the child to exit; stdout must close with it.
