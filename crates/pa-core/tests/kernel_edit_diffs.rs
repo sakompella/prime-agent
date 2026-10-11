@@ -41,8 +41,16 @@ async fn ipython_result_details_carry_the_cell_edit_diffs() {
         skill = edit_skill_src.display().to_string(),
         target = target.display().to_string(),
     );
-    let run =
-        live_kernel::run_cell(&agent_dir, &cwd, &agent_dir.join("sessions"), None, &cell).await;
+    let run = live_kernel::run_cell(
+        &agent_dir,
+        &cwd,
+        live_kernel::SessionStore::Persisted {
+            session_dir: &agent_dir.join("sessions"),
+        },
+        None,
+        &cell,
+    )
+    .await;
 
     assert_eq!(
         std::fs::read_to_string(&target).expect("edited file"),
