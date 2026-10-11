@@ -193,6 +193,11 @@ struct Harness {
 }
 
 fn setup(name: &str) -> Harness {
+    setup_with(name, &json!({}))
+}
+
+/// [`setup`] with extra create-config keys.
+fn setup_with(name: &str, extra_config: &Value) -> Harness {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let agent_dir = dir.path().join("agent");
     let session_dir = agent_dir.join("sessions");
@@ -227,18 +232,16 @@ fn setup(name: &str) -> Harness {
     let socket = dir.path().join(format!("{name}.sock"));
     let supervisor = spawn_supervisor(&socket, &agent_dir);
     let mut client = Client::connect(&socket);
-    client.send_command(
-        "c1",
-        &json!({
-            "type": "create",
-            "config": {
-                "cwd": dir.path().to_string_lossy(),
-                "sessionDir": session_dir.to_string_lossy(),
-                "script": script.to_string_lossy(),
-                "name": name,
-            },
-        }),
-    );
+    let mut config = json!({
+        "cwd": dir.path().to_string_lossy(),
+        "sessionDir": session_dir.to_string_lossy(),
+        "script": script.to_string_lossy(),
+        "name": name,
+    });
+    for (key, value) in extra_config.as_object().into_iter().flatten() {
+        config[key] = value.clone();
+    }
+    client.send_command("c1", &json!({ "type": "create", "config": config }));
     let created = client.request("c1");
     assert_eq!(created["success"], true, "create failed: {created}");
     let session_id = created["data"]["activeSessionId"]
@@ -609,6 +612,150 @@ fn killed_mid_goal_worker_rehydrates_the_goal_with_counts() {
         "the post-recovery mint never announced continuationsUsed {post_final_count}: {:?}",
         harness.client.events
     );
+}
+
+/// The create's `--goal` seed belongs to the session it opened: after `new_session`, a
+/// respawned worker reopens the replacement session without starting that goal in it.
+#[test]
+fn a_respawned_new_session_does_not_replay_the_create_goal() {
+    assert_a_respawned_replacement_skips_the_create_goal(
+        "goal-replay-new",
+        |harness| json!({ "type": "new_session", "activeSessionId": harness.session_id }),
+    );
+}
+
+/// The same for `switch_session` onto an untouched session file.
+#[test]
+fn a_respawned_switched_session_does_not_replay_the_create_goal() {
+    assert_a_respawned_replacement_skips_the_create_goal("goal-replay-switch", |harness| {
+        let untouched = harness.dir.path().join("agent/sessions/untouched.jsonl");
+        let header = json!({
+            "type": "session",
+            "version": 3,
+            "id": "untouched-session",
+            "timestamp": "2026-10-11T00:00:00.000Z",
+            "cwd": harness.dir.path().to_string_lossy(),
+        });
+        std::fs::write(&untouched, format!("{header}\n")).expect("write the untouched session");
+        json!({
+            "type": "switch_session",
+            "activeSessionId": harness.session_id,
+            "sessionPath": untouched.to_string_lossy(),
+        })
+    });
+}
+
+/// Seed a goal through the create, replace the session with `replace`'s command, kill the
+/// worker, and check the respawned worker serves the replacement without the goal.
+fn assert_a_respawned_replacement_skips_the_create_goal(
+    name: &str,
+    replace: impl FnOnce(&Harness) -> Value,
+) {
+    let mut harness = setup_with(name, &json!({ "initialGoal": { "objective": OBJECTIVE } }));
+    let seeded = session_command(&mut harness, "cs1", "get_connection_state");
+    assert_eq!(seeded["data"]["goal"]["objective"], OBJECTIVE, "{seeded}");
+
+    let command = replace(&harness);
+    harness.client.send_command("n1", &command);
+    let replaced = harness.client.request("n1");
+    assert_eq!(
+        replaced["success"], true,
+        "the replacement failed: {replaced}"
+    );
+    let replacement = session_command(&mut harness, "cs2", "get_connection_state");
+    let replacement_file = replacement["data"]["sessionFile"].clone();
+    assert_ne!(
+        replacement_file, seeded["data"]["sessionFile"],
+        "{replacement}"
+    );
+    assert_eq!(
+        replacement["data"]["goal"]["status"], "idle",
+        "{replacement}"
+    );
+    // The supervisor follows the move before the respawn below reads the durable create.
+    let descriptors = harness.dir.path().join("agent").join("daemon-workers");
+    let moved = || {
+        walk_json_files(&descriptors)
+            .into_iter()
+            .any(|descriptor| descriptor["createCommand"]["sessionPath"] == replacement_file)
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !moved() {
+        assert!(
+            Instant::now() < deadline,
+            "the durable create never followed the move"
+        );
+        harness.client.drain_events(Duration::from_millis(200));
+    }
+
+    let worker_pid = session_command(&mut harness, "st1", "get_state")["data"]["workerPid"]
+        .as_u64()
+        .expect("worker pid");
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &worker_pid.to_string()])
+        .status()
+        .expect("kill the captured worker");
+    assert!(killed.success());
+
+    // The first route can still meet the dead worker's socket; the next one reaches the
+    // respawned worker.
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let respawned = loop {
+        let state = session_command(&mut harness, "cs3", "get_connection_state");
+        if state["success"] == true {
+            break state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session never respawned: {state}"
+        );
+    };
+    assert_eq!(
+        respawned["data"]["sessionFile"], replacement_file,
+        "{respawned}"
+    );
+    assert_eq!(
+        respawned["data"]["goal"]["status"], "idle",
+        "the original goal must not start in the replacement session: {respawned}"
+    );
+}
+
+/// Send one argument-free command to the harness session and return its response.
+fn session_command(harness: &mut Harness, id: &str, command_type: &str) -> Value {
+    harness.client.send_command(
+        id,
+        &json!({ "type": command_type, "activeSessionId": harness.session_id }),
+    );
+    harness.client.request(id)
+}
+
+/// Every parseable `*.json` file under `dir`, one level of subdirectories deep.
+fn walk_json_files(dir: &Path) -> Vec<Value> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let files = if path.is_dir() {
+            std::fs::read_dir(&path)
+                .map(|inner| inner.flatten().map(|entry| entry.path()).collect())
+                .unwrap_or_default()
+        } else {
+            vec![path]
+        };
+        for file in files {
+            if file.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                if let Some(value) = std::fs::read_to_string(&file)
+                    .ok()
+                    .and_then(|text| serde_json::from_str(&text).ok())
+                {
+                    found.push(value);
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Deterministic-red regression for the registered flake

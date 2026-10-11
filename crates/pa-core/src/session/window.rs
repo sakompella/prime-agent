@@ -287,7 +287,7 @@ impl WindowedSessionStore {
             }
             if !matches!(
                 meta.kind.as_str(),
-                "model_change" | "thinking_level_change" | "service_tier_change"
+                "model_change" | "thinking_level_change" | "service_tier_change" | "session_state"
             ) {
                 non_bootstrap = true;
             }
@@ -935,6 +935,7 @@ pub(super) fn update_snapshot(snapshot: &mut Snapshot, entry: &FileEntry) {
             | FileEntry::ModelChange { .. }
             | FileEntry::ThinkingLevelChange { .. }
             | FileEntry::ServiceTierChange { .. }
+            | FileEntry::SessionState { .. }
     ) {
         snapshot.non_bootstrap = true;
     }

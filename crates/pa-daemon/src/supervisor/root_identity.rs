@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use pa_types::daemon::DaemonWorkerDescriptor;
+use pa_types::daemon::{DaemonWorkerDescriptor, DurableDaemonCreateCommand};
 use serde_json::Value;
 use tokio::sync::MutexGuard;
 
@@ -47,8 +47,7 @@ impl Supervisor {
         {
             descriptor.root_session_id = Some(session_id.clone());
             descriptor.session_file = Some(session_file.clone());
-            descriptor.create_command.session_path = Some(session_file.clone());
-            descriptor.create_command.no_session = None;
+            retarget_durable_create(&mut descriptor.create_command, &session_file);
         }
         match crate::descriptor::persist_worker(&resident.descriptor_path, &descriptor) {
             Ok(()) => {
@@ -152,11 +151,7 @@ impl Supervisor {
         }
         descriptor.root_session_id = Some(session_id.clone());
         descriptor.session_file = Some(session_file.clone());
-        // The durable create command must reopen the moved-to session on relaunch. A
-        // worker that started `noSession` and switched onto a real file drops the in-memory
-        // flag with the path (the create refuses `noSession`+`sessionPath`).
-        descriptor.create_command.session_path = Some(session_file.clone());
-        descriptor.create_command.no_session = None;
+        retarget_durable_create(&mut descriptor.create_command, &session_file);
         // The durable record is the restart edge: a failed persist leaves the LIVE routing
         // correct while the record lags — keep the transition marked pending so the next
         // roster write repairs it.
@@ -223,6 +218,17 @@ impl Supervisor {
         ));
         true
     }
+}
+
+/// Point the durable create command at a moved-to session, so a relaunch reopens it. A
+/// worker that started `noSession` and switched onto a real file drops the in-memory flag
+/// with the path (the create refuses `noSession`+`sessionPath`). The create's `--goal`
+/// seed belongs to the session the create opened: a replayed create must not start it in
+/// the moved-to session.
+fn retarget_durable_create(create: &mut DurableDaemonCreateCommand, session_file: &str) {
+    create.session_path = Some(session_file.to_string());
+    create.no_session = None;
+    create.rest.remove("initialGoal");
 }
 
 #[cfg(test)]
@@ -356,6 +362,51 @@ mod tests {
             Some(session.to_string()),
             Some(session.to_string()),
         )
+    }
+
+    /// The create's `--goal` seed stays with the session the create opened and leaves the
+    /// durable create on a whole-session move, so a respawn never starts it elsewhere.
+    #[tokio::test]
+    async fn a_session_move_drops_the_create_goal_seed() {
+        let dir = std::env::temp_dir().join(format!("pa-root-id-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let supervisor = supervisor_with_movable_worker(&dir).await;
+        let resident = supervisor.registry.get("w-a").await.expect("resident");
+        resident
+            .descriptor
+            .lock()
+            .await
+            .create_command
+            .rest
+            .insert("initialGoal".to_string(), json!({ "objective": "ship it" }));
+        let durable_seed = || async {
+            let live = resident
+                .descriptor
+                .lock()
+                .await
+                .create_command
+                .rest
+                .get("initialGoal")
+                .cloned();
+            let persisted = std::fs::read_to_string(&resident.descriptor_path)
+                .ok()
+                .and_then(|content| serde_json::from_str::<DaemonWorkerDescriptor>(&content).ok())
+                .and_then(|record| record.create_command.rest.get("initialGoal").cloned());
+            (live, persisted)
+        };
+
+        drive_delta(&supervisor, swap_summary(&dir, "s0", "s0.jsonl"), 1).await;
+        assert_eq!(
+            durable_seed().await.0,
+            Some(json!({ "objective": "ship it" })),
+            "the opened session's own row keeps the seed"
+        );
+        drive_delta(&supervisor, swap_summary(&dir, "sB", "b.jsonl"), 2).await;
+        assert_eq!(
+            durable_seed().await,
+            (None, None),
+            "the move dropped the seed"
+        );
     }
 
     #[tokio::test]
