@@ -158,9 +158,10 @@ fn rpc_abort_ends_the_running_turn() {
     client.wait_frame(|frame| {
         frame["type"] == "message_update" && frame["message"]["role"] == "assistant"
     });
-    let aborted = client.request(&json!({ "type": "abort" }));
+    let (aborted, end) = client.request_and_wait(&json!({ "type": "abort" }), |frame| {
+        frame["type"] == "agent_end"
+    });
     assert_eq!(aborted["success"], true, "{aborted}");
-    let (end, _) = client.wait_frame(|frame| frame["type"] == "agent_end");
     let last = end["messages"]
         .as_array()
         .and_then(|messages| messages.last())
