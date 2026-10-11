@@ -833,3 +833,101 @@ pub async fn run_daemon_attached_rpc_mode(options: DaemonRpcOptions) -> anyhow::
         Ending::Interrupted(interrupt) => connection.exit_on(interrupt).await,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use pa_types::daemon::{DaemonCommandEnvelope, DaemonResponse};
+
+    use super::*;
+
+    /// A worker replacement rebinds the bound session and an observed child:
+    /// the connection attaches both new ids and routes their events in their
+    /// old roles (the bound stream, the child observed under the id the
+    /// client asked for).
+    #[tokio::test]
+    async fn a_session_binding_attaches_and_routes_the_rebound_sessions() {
+        let (writer, mut commands) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let connection = Arc::new(RpcConnection {
+            link: Arc::new(DaemonLink::scripted(writer, Arc::clone(&pending))),
+            writer: LineWriter::spawn(),
+            binding: Mutex::new(Binding {
+                active_session_id: "root".to_string(),
+                lifecycle: DaemonSessionLifecycle::ClientOwned,
+                completing: false,
+                daemon_closing: None,
+            }),
+            output: Mutex::new(Output {
+                prompt_buffer: Some(Vec::new()),
+                observed: HashMap::new(),
+            }),
+        });
+        connection.output.lock().unwrap().observed.insert(
+            "kid".to_string(),
+            Observation::Pending {
+                frames: Vec::new(),
+                closed: false,
+            },
+        );
+        for (previous, current) in [("root", "root-2"), ("kid", "kid-2")] {
+            connection.route_event(LinkEvent::SessionBinding {
+                previous_active_session_id: previous.to_string(),
+                active_session_id: current.to_string(),
+            });
+        }
+        let mut attached = Vec::new();
+        for _ in 0..2 {
+            let line = tokio::time::timeout(Duration::from_secs(5), commands.recv())
+                .await
+                .expect("the rebound session is attached")
+                .expect("the link writer is open");
+            let envelope: DaemonCommandEnvelope = serde_json::from_str(&line).unwrap();
+            let DaemonCommand::Attach {
+                active_session_id, ..
+            } = envelope.command
+            else {
+                panic!("expected an attach, got {:?}", envelope.command);
+            };
+            let reply = pending.lock().unwrap().remove(&envelope.id).unwrap();
+            reply
+                .send(DaemonResponse {
+                    id: Some(envelope.id),
+                    command: "attach".to_string(),
+                    success: true,
+                    data: None,
+                    error: None,
+                    error_info: None,
+                })
+                .unwrap();
+            attached.push(active_session_id);
+        }
+        attached.sort();
+        assert_eq!(attached, vec!["kid-2", "root-2"]);
+        for id in ["root-2", "kid-2"] {
+            connection.route_event(LinkEvent::Session {
+                active_session_id: id.to_string(),
+                event: json!({ "type": "agent_end" }),
+            });
+        }
+        let output = connection.output.lock().unwrap();
+        assert_eq!(
+            output.prompt_buffer,
+            Some(vec![json!({ "type": "agent_end" })]),
+            "the rebound bound session streams unwrapped"
+        );
+        let Some(Observation::Pending { frames, .. }) = output.observed.get("kid") else {
+            panic!("the child stays observed under its requested id");
+        };
+        assert_eq!(
+            frames,
+            &vec![json!({
+                "type": "observed_session_event",
+                "activeSessionId": "kid",
+                "event": { "type": "agent_end" },
+            })]
+        );
+    }
+}
