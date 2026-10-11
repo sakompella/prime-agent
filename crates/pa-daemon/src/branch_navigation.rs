@@ -71,7 +71,7 @@ impl TreeNavigation {
                 "get_session_tree",
                 Some(json!({
                     "flatNodes": session_tree::flat_tree(store),
-                    "leafId": store.leaf_id(),
+                    "leafId": store.tree_position(),
                 })),
             ),
             None => response_failure(
@@ -161,7 +161,7 @@ impl TreeNavigation {
             .map(str::to_string);
 
         // Snapshot the tree state under one lock pass; the model call below runs without it.
-        let (target, old_leaf, entries) = {
+        let (target, old_position, entries) = {
             let core = self.core.lock().unwrap();
             let Some(store) = core.store.as_ref() else {
                 return response_failure(
@@ -179,12 +179,12 @@ impl TreeNavigation {
                     None,
                 );
             };
-            let old_leaf = store.leaf_id().map(str::to_string);
+            let old_position = store.tree_position().map(str::to_string);
             let entries = store.entries().to_vec();
-            (target, old_leaf, entries)
+            (target, old_position, entries)
         };
         // No-op when already at the target (TS checks before pausing work).
-        if Some(target_id) == old_leaf.as_deref() {
+        if Some(target_id) == old_position.as_deref() {
             return response_success(None, "navigate_tree", Some(json!({ "cancelled": false })));
         }
         // A navigation interrupts the running turn first (TS
@@ -205,7 +205,7 @@ impl TreeNavigation {
             let collected =
                 pa_core::session_engine::branch_summarization::collect_entries_for_branch_summary(
                     &file_entries,
-                    old_leaf.as_deref(),
+                    old_position.as_deref(),
                     target_id,
                 );
             if !collected.entries.is_empty() {
@@ -307,15 +307,16 @@ impl TreeNavigation {
                         return response_failure(None, "navigate_tree", &error.to_string(), None)
                     }
                 }
-            } else {
+            } else if let Some(label) = &label {
+                // The label row hangs off the new leaf, so it persists the move.
                 if let Err(error) = store.branch_to(new_leaf.as_deref()) {
                     return response_failure(None, "navigate_tree", &error.to_string(), None);
                 }
-                if let Some(label) = &label {
-                    if let Err(error) = store.append_label_change(target_id, Some(label)) {
-                        return response_failure(None, "navigate_tree", &error.to_string(), None);
-                    }
+                if let Err(error) = store.append_label_change(target_id, Some(label)) {
+                    return response_failure(None, "navigate_tree", &error.to_string(), None);
                 }
+            } else if let Err(error) = store.navigate_to(new_leaf.as_deref()) {
+                return response_failure(None, "navigate_tree", &error.to_string(), None);
             }
             (store.branch_file_entries(), summary_entry)
         };

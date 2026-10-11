@@ -152,6 +152,51 @@ impl SessionFile {
         Ok(())
     }
 
+    /// `navigate_tree`'s plain move, made durable: unless the file's last
+    /// entry already sits at the new leaf's [`Self::tree_position`], a
+    /// [`pa_core::session::TREE_NAVIGATION_CUSTOM_TYPE`] row parented at the
+    /// new leaf becomes the leaf. Either way the leaf ends on the file's last
+    /// entry, which is where a reload puts it. A failed append keeps the old leaf.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target does not exist or the marker cannot be persisted.
+    pub fn navigate_to(&mut self, id: Option<&str>) -> Result<()> {
+        let previous_leaf = self.leaf_id.clone();
+        self.branch_to(id)?;
+        let last = self.entries.last().map(|last| last.id.as_str());
+        if last.is_some() && self.position_of(last) == self.position_of(id) {
+            self.leaf_id = last.map(str::to_string);
+            return Ok(());
+        }
+        let marker = json!({ "customType": pa_core::session::TREE_NAVIGATION_CUSTOM_TYPE });
+        if let Err(error) = self.persist_entry("custom", marker) {
+            self.leaf_id = previous_leaf;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Where the session sits in the tree, the `leafId` clients see: the
+    /// leaf's nearest ancestor-or-self that is not position-neutral
+    /// bookkeeping (`None` when only such rows lead to the root). The raw leaf
+    /// stays the append parent and the reload leaf.
+    #[must_use]
+    pub fn tree_position(&self) -> Option<&str> {
+        self.position_of(self.leaf_id.as_deref())
+    }
+
+    fn position_of<'a>(&'a self, mut id: Option<&'a str>) -> Option<&'a str> {
+        // Bounded: a corrupt parent cycle of bookkeeping rows must terminate.
+        for _ in 0..=self.entries.len() {
+            match id.and_then(|id| self.entry(id)) {
+                Some(entry) if is_position_neutral(entry) => id = entry.parent_id.as_deref(),
+                _ => break,
+            }
+        }
+        id
+    }
+
     /// `branchWithSummary`: move the leaf, then append the
     /// `branch_summary` entry describing the abandoned branch. Returns the
     /// summary entry id.
@@ -362,6 +407,16 @@ fn parent_session_of(store: &SessionFile) -> Option<&str> {
         .flatten()
 }
 
+/// Rows a reported tree position looks through: tree-navigation markers and
+/// `session_state` lifecycle rows (a reopen or revival appends one) carry
+/// neither context nor user intent.
+fn is_position_neutral(entry: &SessionEntry) -> bool {
+    entry.type_ == "session_state"
+        || (entry.type_ == "custom"
+            && entry.fields.get("customType").and_then(Value::as_str)
+                == Some(pa_core::session::TREE_NAVIGATION_CUSTOM_TYPE))
+}
+
 /// Extract the plain text of a user-message entry (string or text-block content).
 #[must_use]
 pub fn user_entry_text(entry: &SessionEntry) -> Option<String> {
@@ -539,6 +594,30 @@ mod tests {
                 prop_assert_eq!(reopened.leaf_id(), store.leaf_id());
                 prop_assert_eq!(branch_ids(&reopened), branch_ids(&store));
             }
+        }
+    }
+
+    /// A reopen appends a `session_state` row after the marker: the reported
+    /// position still names the navigated entry, a root move still reports
+    /// none, and moving there again writes nothing.
+    #[test]
+    fn the_tree_position_looks_through_a_reopens_session_state_row() {
+        let (_dir, mut store) = temp_store();
+        message_entry(&mut store, "user", "first");
+        let answer = message_entry(&mut store, "assistant", "answer");
+        message_entry(&mut store, "user", "second");
+        for target in [Some(answer.as_str()), None] {
+            store.navigate_to(target).unwrap();
+            store
+                .persist_entry("session_state", json!({ "state": { "status": "active" } }))
+                .unwrap();
+            assert_eq!(store.tree_position(), target);
+            let rows = store.entries().len();
+            store.navigate_to(target).unwrap();
+            assert_eq!(
+                (store.entries().len(), store.tree_position()),
+                (rows, target)
+            );
         }
     }
 

@@ -62,7 +62,11 @@ pub fn prepare_compaction(
     entries: &[FileEntry],
     keep_recent_tokens: u64,
 ) -> Result<CompactionPreparation, CompactSkip> {
-    if matches!(entries.last(), Some(FileEntry::Compaction { .. })) {
+    let last = entries
+        .iter()
+        .rev()
+        .find(|entry| !crate::session::is_tree_navigation_marker(entry));
+    if matches!(last, Some(FileEntry::Compaction { .. })) {
         return Err(CompactSkip::AlreadyCompacted);
     }
     // The header is not a compact candidate.
