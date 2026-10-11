@@ -306,7 +306,7 @@ impl SessionFile {
                         object.insert("role".to_string(), Value::String("custom".to_string()));
                         object.insert(
                             "timestamp".to_string(),
-                            Value::String(entry.timestamp.clone()),
+                            json!(crate::util::iso_to_unix_ms(&entry.timestamp).unwrap_or(0)),
                         );
                     }
                     Some(std::borrow::Cow::Owned(message))

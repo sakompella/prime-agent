@@ -584,15 +584,7 @@ impl TurnRunner {
                     }
                     EngineEvent::CustomMessage(message) => {
                         if let Some(store) = core.store.as_mut() {
-                            let _ = store.persist_entry(
-                                "custom_message",
-                                json!({
-                                    "customType": message.get("customType").cloned().unwrap_or(Value::Null),
-                                    "content": message.get("content").cloned().unwrap_or(Value::Null),
-                                    "display": message.get("display").cloned().unwrap_or(Value::Bool(true)),
-                                    "details": message.get("details").cloned().unwrap_or(Value::Null),
-                                }),
-                            );
+                            let _ = store.persist_custom_message(message);
                         }
                     }
                     EngineEvent::Compaction { entry, .. } => {
@@ -902,15 +894,7 @@ impl TurnRunner {
                         let outcome = crate::session_commands::custom_message_value(&outcome);
                         if outcome.is_object() {
                             if let Some(store) = core.store.as_mut() {
-                                let _ = store.persist_entry(
-                                    "custom_message",
-                                    json!({
-                                        "customType": outcome.get("customType").cloned().unwrap_or(Value::Null),
-                                        "content": outcome.get("content").cloned().unwrap_or(Value::Null),
-                                        "display": outcome.get("display").cloned().unwrap_or(Value::Bool(true)),
-                                        "details": outcome.get("details").cloned().unwrap_or(Value::Null),
-                                    }),
-                                );
+                                let _ = store.persist_custom_message(&outcome);
                             }
                         }
                         vec![
