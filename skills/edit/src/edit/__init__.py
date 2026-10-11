@@ -47,23 +47,43 @@ async def run(path: str, old_str: str, new_str: str) -> str:
 
 # Keep in sync with DIFF_DISPLAY_MIME in src/core/kernel/index.ts.
 _DIFF_DISPLAY_MIME = "application/vnd.prime-agent.diff+json"
+# Even fully \u-escaped (12 JSON chars per char), two clipped sides fit the
+# runtime's 16 MiB display frame cap with room to spare.
+_DIFF_TEXT_CAP = 64 * 1024
+
+
+def _clip(text: str) -> str:
+    if len(text) <= _DIFF_TEXT_CAP:
+        return text
+    return f"{text[:_DIFF_TEXT_CAP]}\n[... diff text truncated: {_DIFF_TEXT_CAP} of {len(text)} characters shown ...]"
 
 
 def _emit_diff(path: str, old_str: str, new_str: str, start_line: int) -> None:
-    """Stream a diff to the host as a display event; best-effort outside the kernel."""
+    """Stream a diff to the host as a display event; best-effort outside the kernel.
+
+    A diff over the display frame cap is resent clipped and marked
+    ``truncated``, so a successful edit always leaves a record.
+    """
+    display = {
+        _DIFF_DISPLAY_MIME: {
+            "path": path,
+            "old_str": old_str,
+            "new_str": new_str,
+            "start_line": start_line,
+        },
+        "text/plain": f"Edited {path}",
+    }
     try:
         from rlm import emit
 
-        emit(
-            {
-                _DIFF_DISPLAY_MIME: {
-                    "path": path,
-                    "old_str": old_str,
-                    "new_str": new_str,
-                    "start_line": start_line,
-                },
-                "text/plain": f"Edited {path}",
+        try:
+            emit(display)
+        except ValueError:
+            display[_DIFF_DISPLAY_MIME] |= {
+                "old_str": _clip(old_str),
+                "new_str": _clip(new_str),
+                "truncated": True,
             }
-        )
+            emit(display)
     except Exception:
         pass

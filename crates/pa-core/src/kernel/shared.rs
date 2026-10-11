@@ -122,6 +122,9 @@ pub struct KernelDiffDisplay {
     pub new_str: String,
     /// 1-based line where `old_str` begins in the file, for absolute line numbers.
     pub start_line: Option<u64>,
+    /// The edit skill clipped both texts to fit the display frame cap; the
+    /// file itself received the full edit.
+    pub truncated: bool,
 }
 
 /// One media attachment, captured from an [`ATTACHMENT_DISPLAY_MIME`] display payload.
@@ -385,6 +388,7 @@ pub fn parse_diff_display(payload: &Value) -> Option<KernelDiffDisplay> {
         old_str: old_str.to_string(),
         new_str: new_str.to_string(),
         start_line,
+        truncated: obj.get("truncated").and_then(Value::as_bool) == Some(true),
     })
 }
 
