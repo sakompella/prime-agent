@@ -5,13 +5,14 @@
 
 use std::sync::{Arc, Mutex};
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 use crate::engine::{BranchSummaryRequest, SessionEngine};
 use crate::protocol::{response_failure, response_success, DaemonResponse};
 use crate::session_store::{SessionEntry, SessionFile};
-use crate::session_tree;
+use crate::session_tree::{self, ForkMessageScope};
 use crate::worker::{SessionCore, Worker};
 use pa_agent::abort::AbortController;
 
@@ -83,15 +84,28 @@ impl TreeNavigation {
     }
 
     /// `get_user_messages_for_forking`: the user messages with text (TS
-    /// `getUserMessagesForForking`).
-    pub(crate) fn get_user_messages_for_forking(&self) -> DaemonResponse {
+    /// `getUserMessagesForForking`), whole-session unless the payload's
+    /// `scope` narrows it to the active branch.
+    pub(crate) fn get_user_messages_for_forking(&self, payload: &Value) -> DaemonResponse {
+        let scope = match payload.get("scope").map(ForkMessageScope::deserialize) {
+            None => ForkMessageScope::default(),
+            Some(Ok(scope)) => scope,
+            Some(Err(error)) => {
+                return response_failure(
+                    None,
+                    "get_user_messages_for_forking",
+                    &format!("Invalid scope: {error}"),
+                    None,
+                )
+            }
+        };
         let core = self.core.lock().unwrap();
         match core.store.as_ref() {
             Some(store) => response_success(
                 None,
                 "get_user_messages_for_forking",
                 Some(json!({
-                    "messages": session_tree::user_messages_for_forking(store),
+                    "messages": session_tree::user_messages_for_forking(store, scope),
                 })),
             ),
             None => response_failure(
