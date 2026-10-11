@@ -305,3 +305,31 @@ fn prepare_compaction_boundary_fallback_and_prior_summary_guard() {
         Err(CompactSkip::TooShort)
     );
 }
+
+/// A plain tree move onto a compaction leaves a tree-navigation marker after
+/// it: the branch still ends in that compaction.
+#[test]
+fn prepare_compaction_skips_a_compaction_behind_a_tree_navigation_marker() {
+    let timestamp = "2026-01-01T00:00:00.000Z";
+    let entries: Vec<FileEntry> = [
+        serde_json::json!({
+            "type": "message", "id": "u1", "parentId": null, "timestamp": timestamp,
+            "message": { "role": "user", "content": "hi", "timestamp": 0 },
+        }),
+        serde_json::json!({
+            "type": "compaction", "id": "c1", "parentId": "u1", "timestamp": timestamp,
+            "summary": "summary", "firstKeptEntryId": "u1", "tokensBefore": 100,
+        }),
+        serde_json::json!({
+            "type": "custom", "id": "m1", "parentId": "c1", "timestamp": timestamp,
+            "customType": crate::session::TREE_NAVIGATION_CUSTOM_TYPE,
+        }),
+    ]
+    .into_iter()
+    .map(|entry| serde_json::from_value(entry).expect("a known entry"))
+    .collect();
+    assert_eq!(
+        prepare_compaction(&entries, 10),
+        Err(CompactSkip::AlreadyCompacted)
+    );
+}

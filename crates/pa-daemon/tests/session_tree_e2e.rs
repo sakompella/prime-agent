@@ -424,13 +424,13 @@ fn session_tree_commands_over_the_supervisor_wire() {
 }
 
 /// Reopen the session file from disk, as a resume or a revival does: it
-/// must land on the live session's leaf and context.
+/// must sit where the live session reports it sits, with the same context.
 fn assert_a_reload_matches_the_live_session(
     client: &mut Client,
     session_id: &str,
     session_file: &std::path::Path,
     id: &str,
-) {
+) -> serde_json::Value {
     client.send_command(
         &format!("{id}-tree"),
         &serde_json::json!({ "type": "get_session_tree", "activeSessionId": session_id }),
@@ -449,10 +449,18 @@ fn assert_a_reload_matches_the_live_session(
         .map(|entry| content_text(&entry.fields["message"]))
         .collect();
     assert_eq!(
-        (reopened.leaf_id(), reopened_texts),
+        (reopened.tree_position(), reopened_texts),
         (tree["data"]["leafId"].as_str(), live_texts),
-        "{id}: the reloaded leaf and context"
+        "{id}: the reloaded position and context"
     );
+    tree["data"]["leafId"].clone()
+}
+
+fn line_count(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path)
+        .expect("read session file")
+        .lines()
+        .count()
 }
 
 /// A plain move (no summary, no label) only moved the in-memory leaf before:
@@ -476,41 +484,51 @@ fn a_plain_tree_move_survives_a_reload() {
         .to_string(),
     )
     .expect("write script");
+    let config = serde_json::json!({
+        "cwd": dir.path().to_string_lossy(),
+        "sessionDir": session_dir.to_string_lossy(),
+        "script": script_path.to_string_lossy(),
+    });
     client.send_command(
         "c1",
-        &serde_json::json!({
-            "type": "create",
-            "config": {
-                "cwd": dir.path().to_string_lossy(),
-                "sessionDir": session_dir.to_string_lossy(),
-                "script": script_path.to_string_lossy(),
-            },
-        }),
+        &serde_json::json!({ "type": "create", "config": config }),
     );
-    let created = client.read_response("c1");
-    assert_eq!(created["success"], true, "create failed: {created}");
-    let session_id = created["data"]["id"]
-        .as_str()
-        .or_else(|| created["data"]["sessionId"].as_str())
-        .expect("session id")
-        .to_string();
+    let mut session_id = created_session_id(&client.read_response("c1"));
     scripted_turn(&mut client, &session_id, "first question", "p1");
     scripted_turn(&mut client, &session_id, "second question", "p2");
     client.send_command(
-        "f0",
-        &serde_json::json!({
-            "type": "get_user_messages_for_forking",
-            "activeSessionId": session_id,
-        }),
+        "t0",
+        &serde_json::json!({ "type": "get_session_tree", "activeSessionId": session_id }),
     );
-    let forks = client.read_response("f0");
-    let user_entry = |index: usize| {
-        forks["data"]["messages"][index]["entryId"]
-            .as_str()
-            .unwrap_or_else(|| panic!("user entry {index}: {forks}"))
-            .to_string()
+    let tree = client.read_response("t0");
+    let entries: Vec<serde_json::Value> = tree["data"]["flatNodes"]
+        .as_array()
+        .expect("flatNodes")
+        .iter()
+        .map(|node| node["entry"].clone())
+        .collect();
+    let user_entry = |content: &str| {
+        entries
+            .iter()
+            .find(|entry| {
+                entry["type"] == "message"
+                    && entry["message"]["role"] == "user"
+                    && entry["message"]["content"].as_str() == Some(content)
+            })
+            .unwrap_or_else(|| panic!("the user entry {content}: {tree}"))
     };
-    let (first_user_id, second_user_id) = (user_entry(0), user_entry(1));
+    // A user-message target lands on its parent, reported past the
+    // `session_state` rows a create appends.
+    let navigation_point = |target: &serde_json::Value| {
+        let mut point = target["parentId"].clone();
+        while let Some(entry) = entries.iter().find(|entry| entry["id"] == point) {
+            if entry["type"] != "session_state" {
+                break;
+            }
+            point = entry["parentId"].clone();
+        }
+        point
+    };
     let session_file = std::fs::read_dir(&session_dir)
         .expect("read session dir")
         .flatten()
@@ -518,21 +536,96 @@ fn a_plain_tree_move_survives_a_reload() {
         .find(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
         .expect("the session file");
 
-    // Before the second prompt, then before the first: the root user message
-    // leaves no entry to stand on.
-    for (id, target) in [("n1", &second_user_id), ("n2", &first_user_id)] {
+    // Before the second prompt (the first answer), then before the first.
+    for (id, target) in [
+        ("n1", user_entry("second question")),
+        ("n2", user_entry("first question")),
+    ] {
+        navigate(&mut client, &session_id, id, &target["id"]);
+        let position =
+            assert_a_reload_matches_the_live_session(&mut client, &session_id, &session_file, id);
+        assert_eq!(
+            position,
+            navigation_point(target),
+            "{id}: the navigation point"
+        );
+
+        // Moving to the same point again writes nothing.
+        let lines = line_count(&session_file);
+        navigate(
+            &mut client,
+            &session_id,
+            &format!("{id}-again"),
+            &target["id"],
+        );
+        if position.is_string() {
+            let noop = navigate(&mut client, &session_id, &format!("{id}-noop"), &position);
+            assert_eq!(noop["data"], serde_json::json!({ "cancelled": false }));
+        }
+        assert_eq!(line_count(&session_file), lines, "{id}: no second marker");
+
+        // A worker reopen appends a `session_state` row: both reported
+        // leaf ids still name the navigation point.
         client.send_command(
-            id,
+            &format!("{id}-kill"),
+            &serde_json::json!({ "type": "kill", "activeSessionId": session_id }),
+        );
+        let killed = client.read_response(&format!("{id}-kill"));
+        assert_eq!(killed["success"], true, "{id}: kill failed: {killed}");
+        client.send_command(
+            &format!("{id}-reopen"),
             &serde_json::json!({
-                "type": "navigate_tree",
-                "activeSessionId": session_id,
-                "targetId": target,
+                "type": "create",
+                "sessionPath": session_file.to_string_lossy(),
+                "config": config,
             }),
         );
-        let navigated = client.read_response(id);
-        assert_eq!(navigated["success"], true, "{id} failed: {navigated}");
-        assert_a_reload_matches_the_live_session(&mut client, &session_id, &session_file, id);
+        session_id = created_session_id(&client.read_response(&format!("{id}-reopen")));
+        client.send_command(
+            &format!("{id}-state"),
+            &serde_json::json!({ "type": "get_connection_state", "activeSessionId": session_id }),
+        );
+        let state = client.read_response(&format!("{id}-state"));
+        let tree_leaf = assert_a_reload_matches_the_live_session(
+            &mut client,
+            &session_id,
+            &session_file,
+            &format!("{id}-reopened"),
+        );
+        assert_eq!(
+            (&tree_leaf, &state["data"]["leafId"]),
+            (&position, &position),
+            "{id}: the reopened session's tree and connection-state leaf ids"
+        );
     }
+}
+
+fn created_session_id(created: &serde_json::Value) -> String {
+    assert_eq!(created["success"], true, "create failed: {created}");
+    created["data"]["id"]
+        .as_str()
+        .or_else(|| created["data"]["sessionId"].as_str())
+        .expect("session id")
+        .to_string()
+}
+
+fn navigate(
+    client: &mut Client,
+    session_id: &str,
+    request: &str,
+    target_id: &serde_json::Value,
+) -> serde_json::Value {
+    client.send_command(
+        request,
+        &serde_json::json!({
+            "type": "navigate_tree",
+            "activeSessionId": session_id,
+            "targetId": target_id,
+        }),
+    );
+    let navigated = client.read_response(request);
+    assert_eq!(navigated["success"], true, "{request} failed: {navigated}");
+    navigated
 }
 
 struct WorkerClient {

@@ -116,7 +116,7 @@ impl Worker {
             session_dir: store
                 .and_then(|s| s.path.parent())
                 .map(|p| p.to_string_lossy().to_string()),
-            leaf_id: store.and_then(|s| s.leaf_id().map(str::to_string)),
+            leaf_id: store.and_then(|s| s.tree_position().map(str::to_string)),
             auto_compaction_enabled: core.auto_compaction_enabled,
             message_count: store.map_or(0, crate::session_store::SessionFile::message_count) as u32,
             session_actions: session_snapshot(core),
