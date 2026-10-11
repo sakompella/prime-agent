@@ -29,6 +29,73 @@ pub struct DaemonRpcOptions {
     pub create: DaemonCommand,
 }
 
+/// `prime-agent --capabilities`: the fork identity T3 Code reads to tell this
+/// fork's rpc surface from stock upstream 0.10, which reports the same
+/// version. Bump [`T3_FORK_CONTRACT`] when the T3-facing rpc commands or
+/// frames change.
+#[must_use]
+pub fn t3_fork_capabilities(version: &str) -> Value {
+    json!({
+        "fork": "t3fork",
+        "contract": T3_FORK_CONTRACT,
+        "version": version,
+        "rpc": RPC_COMMANDS,
+    })
+}
+
+pub const T3_FORK_CONTRACT: u32 = 1;
+
+/// Every command [`RpcRoute::of`] routes; a new route joins this list.
+const RPC_COMMANDS: &[&str] = &[
+    "prompt",
+    "steer",
+    "follow_up",
+    "abort",
+    "new_session",
+    "switch_session",
+    "get_state",
+    "set_model",
+    "cycle_model",
+    "get_available_models",
+    "set_thinking_level",
+    "cycle_thinking_level",
+    "set_steering_mode",
+    "set_follow_up_mode",
+    "compact",
+    "refine",
+    "set_auto_compaction",
+    "set_auto_retry",
+    "abort_retry",
+    "bash",
+    "abort_bash",
+    "get_session_stats",
+    "export_html",
+    "fork",
+    "navigate_tree",
+    "clone",
+    "get_fork_messages",
+    "get_last_assistant_text",
+    "set_session_name",
+    "get_messages",
+    "get_commands",
+    "get_rlm_children",
+    "send_message",
+    "agent_messages_status",
+    "agent_messages_pause",
+    "agent_messages_resume",
+    "agent_messages_clear",
+    "list_schedules",
+    "add_schedule",
+    "cancel_schedule",
+    "list_heartbeats",
+    "get_heartbeat",
+    "set_heartbeat",
+    "update_heartbeat",
+    "manage_heartbeat",
+    "observe",
+    "unobserve",
+];
+
 /// How one rpc command reaches the daemon (TS `rpc-mode.js` `handleCommand`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RpcRoute {
@@ -949,6 +1016,13 @@ mod tests {
     use pa_types::daemon::{DaemonCommandEnvelope, DaemonResponse};
 
     use super::*;
+
+    #[test]
+    fn every_advertised_rpc_command_has_a_route() {
+        for command in RPC_COMMANDS {
+            assert_ne!(RpcRoute::of(command), RpcRoute::Unknown, "{command}");
+        }
+    }
 
     /// A connection bound to `root` over a scripted link, observing each of
     /// `observed` live. A pending prompt response holds every emitted frame
