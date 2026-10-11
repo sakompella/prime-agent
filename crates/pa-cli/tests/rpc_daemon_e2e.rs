@@ -73,6 +73,46 @@ fn rpc_spawned_child_streams_and_its_reply_reaches_the_parent() {
     );
 }
 
+/// History replays a custom row with the timestamp its live frame carried,
+/// as 0.9.8 did: T3 Code matches a replayed message to the streamed one by
+/// that timestamp.
+#[test]
+fn rpc_history_replays_a_custom_message_with_its_live_timestamp() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let mut client = RpcChild::spawn_with_children(
+        &["--mode", "rpc"],
+        &spawn_parent_script(&["notice seen"]),
+        &json!({ "responses": ["kid done"] }),
+        &kernel_python,
+    );
+    let response = client.request(&json!({ "type": "prompt", "message": "spawn the kid" }));
+    assert_eq!(response["success"], true, "{response}");
+    let (live, _) = client.wait_frame(|frame| {
+        frame["type"] == "message_end"
+            && frame["message"]["customType"] == "rlm_child_terminal_notice"
+    });
+    client.wait_frame(|frame| is_assistant_end_with(frame, "notice seen"));
+    let history = client.request(&json!({ "type": "get_messages" }));
+    let replayed = history["data"]["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message["customType"] == "rlm_child_terminal_notice")
+        })
+        .unwrap_or_else(|| panic!("the history holds the notice: {history}"));
+    assert!(
+        live["message"]["timestamp"].is_u64(),
+        "the live frame stamps epoch ms: {live}"
+    );
+    assert_eq!(
+        replayed["timestamp"], live["message"]["timestamp"],
+        "the replayed notice: {replayed}"
+    );
+}
+
 #[test]
 fn rpc_child_agent_message_wakes_the_parent() {
     let Some(kernel_python) = kernel_python() else {
