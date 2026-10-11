@@ -234,14 +234,24 @@ pub fn shutdown_sandboxed_daemon(socket: &Path) {
     let Ok(mut stream) = pa_types::platform::transport::connect_blocking(socket) else {
         return;
     };
+    let Ok(reader) = stream.try_clone_box() else {
+        return;
+    };
+    let _ = reader.set_read_timeout(TIMEOUT);
     let frame = format!(
         "{{\"type\":\"command\",\"id\":\"shutdown-test\",\"protocol\":{{\"name\":\"prime-agent.daemon\",\"version\":{}}},\"command\":{{\"type\":\"shutdown\"}}}}\n",
         pa_types::daemon::DAEMON_PROTOCOL_VERSION
     );
-    let _ = stream.write_all(frame.as_bytes());
-    let _ = stream.flush();
-    // The supervisor exits after the shutdown response.
-    std::thread::sleep(Duration::from_millis(300));
+    if stream.write_all(frame.as_bytes()).is_err() || stream.flush().is_err() {
+        return;
+    }
+    // The supervisor answers, then exits: the connection reaching EOF is
+    // the readiness signal that it is gone.
+    for line in BufReader::new(reader).lines() {
+        if line.is_err() {
+            return;
+        }
+    }
 }
 
 /// The kernel interpreter the RLM lanes need: `PA_E2E_KERNEL_PYTHON`, else

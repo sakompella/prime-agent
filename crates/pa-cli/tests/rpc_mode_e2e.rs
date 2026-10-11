@@ -180,8 +180,75 @@ fn rpc_compact_answers_the_skip_error() {
         &turn_script(&json!(["unused"])),
     );
     let response = client.request(&json!({ "type": "compact" }));
-    assert_eq!(response["success"], false, "the response: {response}");
-    assert!(response["error"].is_string(), "{response}");
+    assert_eq!(
+        response,
+        json!({
+            "id": response["id"],
+            "type": "response",
+            "command": "compact",
+            "success": false,
+            "error": "Session is too short to compact — try again once it grows",
+        })
+    );
+}
+
+/// A compaction that runs streams its start and end frames to the rpc
+/// client ahead of the response carrying the summary.
+#[test]
+fn rpc_compact_streams_its_frames_and_answers_the_summary() {
+    let mut client = RpcChild::spawn_configured(
+        &["--mode", "rpc", "--no-session"],
+        &turn_script(&json!([
+            "turn one reply",
+            "turn two reply",
+            "the summary",
+            "the summary"
+        ])),
+        |home, _| {
+            let agent_dir = home.join(".prime/agent");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            std::fs::write(
+                agent_dir.join("settings.json"),
+                json!({ "compaction": { "enabled": true, "keepRecentTokens": 10 } }).to_string(),
+            )
+            .unwrap();
+        },
+    );
+    for message in [
+        format!("turn one {}", "x".repeat(8_000)),
+        "turn two".to_string(),
+    ] {
+        let response = client.request(&json!({ "type": "prompt", "message": message }));
+        assert_eq!(response["success"], true, "{response}");
+        client.wait_event("agent_end");
+    }
+    let id = client.command(&json!({ "type": "compact" }));
+    let (response, before) = client.wait_response(&id);
+    assert_eq!(response["success"], true, "{response}");
+    assert!(
+        response["data"]["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("the summary")),
+        "{response}"
+    );
+    let boundaries: Vec<&Value> = before
+        .iter()
+        .filter(|frame| {
+            matches!(
+                frame["type"].as_str(),
+                Some("compaction_start" | "compaction_end")
+            )
+        })
+        .collect();
+    let [start, end] = boundaries.as_slice() else {
+        panic!("one start and one end frame precede the response: {before:?}");
+    };
+    assert_eq!(start["type"], "compaction_start", "{before:?}");
+    assert_eq!(end["type"], "compaction_end", "{before:?}");
+    assert_eq!(
+        end["result"], response["data"],
+        "the end frame carries the answered result"
+    );
 }
 
 /// The daemon-only surfaces answer over the daemon session instead of the

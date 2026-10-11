@@ -177,11 +177,29 @@ fn rpc_observe_streams_a_child_session() {
     let Some(kernel_python) = kernel_python() else {
         return;
     };
-    let mut client = RpcChild::spawn_with_children(
+    // The child's first turn holds in a cell until the test creates the
+    // gate file, so it is provably running while the test observes it.
+    let gate = std::cell::OnceCell::new();
+    let mut client = RpcChild::spawn_configured(
         &["--mode", "rpc"],
         &spawn_parent_script(&["notice seen"]),
-        &json!({ "responses": [{ "text": "kid done", "delayMs": 4_000 }] }),
-        &kernel_python,
+        |home, command| {
+            let gate_path = home.join("release-child");
+            let hold = format!(
+                "import asyncio, os\nwhile not os.path.exists({:?}):\n    await asyncio.sleep(0.05)",
+                gate_path.display().to_string()
+            );
+            let child_script = json!({ "engine": "faux", "responses": [
+                ipython_call(&hold),
+                { "text": "kid done" },
+            ] });
+            let child_script_path = home.join("child-script.json");
+            std::fs::write(&child_script_path, child_script.to_string()).unwrap();
+            command
+                .env("PRIME_AGENT_FAUX_CHILD_SCRIPT", &child_script_path)
+                .env("PRIME_AGENT_KERNEL_PYTHON", &kernel_python);
+            gate.set(gate_path).unwrap();
+        },
     );
     let response = client.request(&json!({ "type": "prompt", "message": "spawn the kid" }));
     assert_eq!(response["success"], true, "{response}");
@@ -204,6 +222,7 @@ fn rpc_observe_streams_a_child_session() {
             .all(|frame| frame["type"] != "observed_session_event"),
         "no observed frame precedes the observe response: {before:?}"
     );
+    std::fs::write(gate.get().expect("the gate path"), "").unwrap();
     let (end, _) = client.wait_frame(|frame| {
         frame["type"] == "observed_session_event"
             && frame["activeSessionId"] == child_session
