@@ -396,7 +396,8 @@ struct SupervisorChildSessionsInner {
     /// the registry so `collect` answers a just-deleted selector.
     deleted_children: std::sync::Mutex<std::collections::HashMap<String, DeletedChild>>,
     /// Bumped once per completed parent turn: mid-turn prompt tasks wait for the next bump (the
-    /// continuation is in flight before the child's first model turn).
+    /// continuation is in flight before the child's first model turn). A blocking collect bumps
+    /// it too: the parent's turn then waits on its children, so no continuation is coming.
     turn_done: tokio::sync::watch::Sender<u64>,
     /// The parent engine's child-settle hook (goal continuation resume).
     settle_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -501,7 +502,7 @@ impl SupervisorChildSessions {
     /// The worker saw the parent's turn end: release prompt tasks waiting
     /// on the boundary (called once per `EngineEvent::Done`).
     pub fn notify_turn_done(&self) {
-        self.inner.turn_done.send_modify(|value| *value += 1);
+        self.inner.release_turn_gated_prompts();
     }
 
     /// Register the child-settle hook: fired once per settled child run
@@ -891,6 +892,33 @@ impl SupervisorChildSessionsInner {
             .clone();
         if let Some(hook) = hook {
             std::thread::spawn(move || hook());
+        }
+    }
+
+    /// Release the task prompts waiting on the parent's turn boundary.
+    pub(crate) fn release_turn_gated_prompts(&self) {
+        self.turn_done.send_modify(|value| *value += 1);
+    }
+
+    /// Wait until `record`'s settle funnel fires or `deadline` passes: the
+    /// verdict the settle watcher reaches, not a raw idle read (a child
+    /// whose task prompt is not admitted yet is idle).
+    pub(crate) async fn wait_for_settle(
+        &self,
+        record: &Arc<Mutex<ChildRecord>>,
+        deadline: Instant,
+    ) {
+        let deadline = tokio::time::Instant::from_std(deadline);
+        loop {
+            // Register the permit before the read: a settle between the
+            // read and the await still wakes this waiter.
+            let settled = self.settle_notify.notified();
+            if record.lock().await.settled {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, settled).await.is_err() {
+                return;
+            }
         }
     }
 
