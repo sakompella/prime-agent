@@ -73,11 +73,14 @@ pub enum EngineEvent {
     },
     ToolExecutionUpdate {
         tool_call_id: String,
+        tool_name: String,
+        args: Value,
         partial_result: Value,
     },
     /// A tool call finished; `is_error` mirrors the tool result.
     ToolExecutionEnd {
         tool_call_id: String,
+        tool_name: String,
         result: Value,
         is_error: bool,
     },

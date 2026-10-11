@@ -768,19 +768,25 @@ impl TurnRunner {
                     })],
                     EngineEvent::ToolExecutionUpdate {
                         tool_call_id,
+                        tool_name,
+                        args,
                         partial_result,
                     } => vec![json!({
                         "type": "tool_execution_update",
                         "toolCallId": tool_call_id,
+                        "toolName": tool_name,
+                        "args": args,
                         "partialResult": partial_result,
                     })],
                     EngineEvent::ToolExecutionEnd {
                         tool_call_id,
+                        tool_name,
                         result,
                         is_error,
                     } => vec![json!({
                         "type": "tool_execution_end",
                         "toolCallId": tool_call_id,
+                        "toolName": tool_name,
                         "result": result,
                         "isError": is_error,
                     })],
