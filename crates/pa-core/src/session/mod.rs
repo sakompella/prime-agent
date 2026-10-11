@@ -28,6 +28,19 @@ pub const CURRENT_SESSION_VERSION: u32 = 3;
 /// `{ "shown": true }`.
 pub const ANTHROPIC_WARNING_SHOWN_CUSTOM_TYPE: &str = "anthropic_subscription_warning_shown";
 
+/// `custom` entry `customType` recording a plain tree move (`navigate_tree`
+/// without a summary or label): the row hangs off the new leaf, root-level for
+/// a move above the first entry, so a reload, which takes the file's last
+/// entry as the leaf, lands where the move did. It carries no `data` and
+/// never enters the model context.
+pub const TREE_NAVIGATION_CUSTOM_TYPE: &str = "tree_navigation";
+
+/// Whether `entry` is a [`TREE_NAVIGATION_CUSTOM_TYPE`] marker row.
+#[must_use]
+pub fn is_tree_navigation_marker(entry: &FileEntry) -> bool {
+    matches!(entry, FileEntry::Custom { payload, .. } if payload.custom_type == TREE_NAVIGATION_CUSTOM_TYPE)
+}
+
 /// Entry types that can represent user intent (vs. daemon bookkeeping).
 pub const CONTENT_ENTRY_TYPES: [&str; 10] = [
     "message",

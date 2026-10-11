@@ -332,6 +332,103 @@ fn rpc_navigate_tree_survives_a_resume() {
     assert_eq!(fork_message_texts(&mut resumed), vec!["first turn"]);
 }
 
+/// The reported `leafId` is the navigation point, also after the resume's
+/// worker appended its `session_state` row behind the marker.
+#[test]
+fn rpc_resume_keeps_the_reported_tree_position() {
+    let mut client = two_turn_session();
+    let navigated = roll_back_the_second_turn(&mut client);
+    assert_eq!(navigated["success"], true, "{navigated}");
+    let state = client.request(&json!({ "type": "get_state" }));
+    let position = state["data"]["leafId"].clone();
+    assert!(position.is_string(), "{state}");
+    let session_file = state["data"]["sessionFile"]
+        .as_str()
+        .expect("a session file")
+        .to_string();
+    client.close_stdin();
+    assert!(client.wait_closed().success());
+    let mut resumed = client.join(
+        "resumed-script.json",
+        &["--mode", "rpc", "--resume", &session_file],
+        &json!({ "engine": "faux", "responses": [] }),
+        |_, _| {},
+    );
+    let resumed_state = resumed.request(&json!({ "type": "get_state" }));
+    assert_eq!(resumed_state["data"]["leafId"], position, "{resumed_state}");
+}
+
+/// A rollback above a root user entry reports no position, so there is
+/// nothing to clone. A resume then gives the empty branch the creation
+/// settings a fresh session gets (`thinking_level_change`,
+/// `service_tier_change`) and a `session_state` row: the reported position is
+/// the last settings row, as for a fresh session, never the state row.
+#[test]
+fn rpc_a_root_rollback_reports_no_position_until_a_resume_adds_settings() {
+    let bootstrap = RpcChild::spawn(
+        &["--mode", "rpc"],
+        &json!({ "engine": "faux", "responses": [] }),
+    );
+    let session_file = bootstrap.home().join("rooted.jsonl");
+    let header = json!({
+        "type": "session", "version": 3, "id": "rooted-session",
+        "timestamp": "2026-10-11T00:00:00.000Z", "cwd": bootstrap.home(),
+    });
+    let user = json!({
+        "type": "message", "id": "root-user", "parentId": null,
+        "timestamp": "2026-10-11T00:00:00.000Z",
+        "message": { "role": "user", "content": "first", "timestamp": 0 },
+    });
+    std::fs::write(&session_file, format!("{header}\n{user}\n")).unwrap();
+    let resume = |name: &str| {
+        bootstrap.join(
+            name,
+            &["--mode", "rpc", "--resume", session_file.to_str().unwrap()],
+            &json!({ "engine": "faux", "responses": [] }),
+            |_, _| {},
+        )
+    };
+    let mut client = resume("first-script.json");
+    let navigated = client.request(&json!({ "type": "navigate_tree", "targetId": "root-user" }));
+    assert_eq!(navigated["success"], true, "{navigated}");
+    let state = client.request(&json!({ "type": "get_state" }));
+    assert!(state["data"]["leafId"].is_null(), "{state}");
+    let cloned = client.request(&json!({ "type": "clone" }));
+    assert_eq!(
+        cloned["error"], "Cannot clone session: no current entry selected",
+        "{cloned}"
+    );
+    client.close_stdin();
+    assert!(client.wait_closed().success());
+
+    let mut resumed = resume("second-script.json");
+    let state = resumed.request(&json!({ "type": "get_state" }));
+    let rows: Vec<Value> = std::fs::read_to_string(&session_file)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let types_after_the_marker: Vec<&str> = rows
+        .iter()
+        .skip_while(|row| row["customType"] != "tree_navigation")
+        .map(|row| row["type"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        types_after_the_marker,
+        vec![
+            "custom",
+            "thinking_level_change",
+            "service_tier_change",
+            "session_state"
+        ]
+    );
+    assert_eq!(
+        state["data"]["leafId"],
+        rows[rows.len() - 2]["id"],
+        "{state}"
+    );
+}
+
 /// T3 baselines its turns on `get_fork_messages`: after a rollback it lists
 /// only the active branch's user entries, not the abandoned one.
 #[test]
