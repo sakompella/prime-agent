@@ -227,6 +227,41 @@ fn rpc_observe_streams_a_child_session() {
     );
 }
 
+/// `navigate_tree` moves the leaf in place: the branch shortens, the file stays.
+#[test]
+fn rpc_navigate_tree_rolls_the_session_back_in_place() {
+    let mut client = RpcChild::spawn(
+        &["--mode", "rpc"],
+        &json!({ "engine": "faux", "responses": ["one", "two"] }),
+    );
+    for message in ["first turn", "second turn"] {
+        let response = client.request(&json!({ "type": "prompt", "message": message }));
+        assert_eq!(response["success"], true, "{response}");
+        client.wait_event("agent_end");
+    }
+    let before = client.request(&json!({ "type": "get_state" }));
+    let forks = client.request(&json!({ "type": "get_fork_messages" }));
+    let second_turn = forks["data"]["messages"][1]["entryId"].clone();
+    assert!(second_turn.is_string(), "{forks}");
+    let navigated = client.request(&json!({ "type": "navigate_tree", "targetId": second_turn }));
+    assert_eq!(
+        navigated["data"],
+        json!({ "cancelled": false, "editorText": "second turn" }),
+        "{navigated}"
+    );
+    let messages = client.request(&json!({ "type": "get_messages" }));
+    let texts: Vec<&str> = messages["data"]["messages"]
+        .as_array()
+        .expect("the messages")
+        .iter()
+        .filter(|message| matches!(message["role"].as_str(), Some("user" | "assistant")))
+        .map(first_text)
+        .collect();
+    assert_eq!(texts, vec!["first turn", "one"], "{messages}");
+    let after = client.request(&json!({ "type": "get_state" }));
+    assert_eq!(after["data"]["sessionFile"], before["data"]["sessionFile"]);
+}
+
 /// `--extension` fails before any daemon work: no supervisor starts.
 #[test]
 fn rpc_rejects_extensions_before_any_daemon_work() {
