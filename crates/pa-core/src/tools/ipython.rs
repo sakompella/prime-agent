@@ -53,6 +53,9 @@ pub struct ExecuteResult {
     pub background_output: Option<String>,
     pub error: Option<KernelErrorInfo>,
     pub attachments: Vec<KernelAttachment>,
+    /// File edits made by this cell, in order (TS `diffs` on the tool-result
+    /// details).
+    pub diffs: Vec<crate::kernel::shared::KernelDiffDisplay>,
     /// Agent messages sent from this cell, in order (TS
     /// `sentAgentMessages` on the tool-result details).
     pub sent_agent_messages: Vec<crate::kernel::shared::KernelSentAgentMessage>,
@@ -469,6 +472,23 @@ pub async fn execute_ipython(
             "traceback": error.traceback,
         });
         details["errorEname"] = json!(error.ename);
+    }
+    if !r.diffs.is_empty() {
+        details["diffs"] = json!(r
+            .diffs
+            .iter()
+            .map(|diff| {
+                let mut value = json!({
+                    "path": diff.path,
+                    "oldStr": diff.old_str,
+                    "newStr": diff.new_str,
+                });
+                if let Some(start_line) = diff.start_line {
+                    value["startLine"] = json!(start_line);
+                }
+                value
+            })
+            .collect::<Vec<_>>());
     }
     if !r.sent_agent_messages.is_empty() {
         details["sentAgentMessages"] = json!(r
