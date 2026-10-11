@@ -245,15 +245,25 @@ enum Lane {
     Observation,
 }
 
-/// Why the stdin loop stopped serving.
-enum Ending {
-    /// Stdin closed: settle the session, release it, exit 0.
-    InputClosed,
+/// What ends the process from outside the stdin loop; it can arrive at any
+/// point, including while the EOF settle runs.
+enum Interrupt {
     /// SIGTERM (143) or SIGHUP (129).
     Signal { exit_code: i32 },
     /// The bound session closed or the daemon link dropped: exit 1 with the reason.
     Lost(String),
 }
+
+/// Why the stdin loop stopped serving.
+enum Ending {
+    /// Stdin closed: settle the session, release it, exit 0.
+    InputClosed,
+    Interrupted(Interrupt),
+}
+
+/// The signal exit's budget for its own daemon requests (abort, release):
+/// a hung daemon must not hold the 143/129 exit.
+const SIGNAL_RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The daemon session this connection serves.
 struct Binding {
@@ -262,6 +272,9 @@ struct Binding {
     /// `ClientOwned` until a schedule promotes the session: the teardown
     /// completes an owned session and detaches from a resident one.
     lifecycle: DaemonSessionLifecycle,
+    /// Set once this client asked the daemon to complete the session: the
+    /// session close that follows is expected, not a loss.
+    completing: bool,
     /// The supervisor's announced stop, which explains the session close that follows.
     daemon_closing: Option<DaemonClosingReason>,
 }
@@ -490,22 +503,58 @@ impl RpcConnection {
 
     /// Release the bound session: complete it while this client owns it
     /// (the worker stops), detach from it once a schedule promoted it.
-    async fn release_session(&self) {
-        let (active_session_id, lifecycle) = {
-            let binding = self.binding.lock().unwrap();
-            (binding.active_session_id.clone(), binding.lifecycle)
+    async fn release_session(&self) -> Result<(), String> {
+        let (active_session_id, release) = {
+            let mut binding = self.binding.lock().unwrap();
+            let release = match binding.lifecycle {
+                DaemonSessionLifecycle::ClientOwned => {
+                    binding.completing = true;
+                    "complete_owned_session"
+                }
+                DaemonSessionLifecycle::Resident => "detach",
+            };
+            (binding.active_session_id.clone(), release)
         };
-        let release = match lifecycle {
-            DaemonSessionLifecycle::ClientOwned => "complete_owned_session",
-            DaemonSessionLifecycle::Resident => "detach",
-        };
-        let _ = self
-            .send(json!({ "type": release, "activeSessionId": active_session_id }))
-            .await;
+        self.send(json!({ "type": release, "activeSessionId": active_session_id }))
+            .await
+            .map(|_| ())
     }
 
-    /// Route one link event to stdout. Returns the ending a closed bound session causes.
-    fn route_event(&self, event: LinkEvent) -> Option<Ending> {
+    /// Exit on an interrupt, wherever the stdin loop or the EOF settle is.
+    /// The stdin reader thread never returns on its own, so the exit must
+    /// not wait for the runtime to join it.
+    async fn exit_on(&self, interrupt: Interrupt) -> ! {
+        match interrupt {
+            Interrupt::Signal { exit_code } => {
+                // An owned session stops with this client: its turn settles
+                // aborted first. A promoted one keeps running in the daemon.
+                let _ = tokio::time::timeout(SIGNAL_RELEASE_BUDGET, async {
+                    let owned = self.binding.lock().unwrap().lifecycle
+                        == DaemonSessionLifecycle::ClientOwned;
+                    if owned {
+                        let _ = self
+                            .send(json!({
+                                "type": "abort",
+                                "activeSessionId": self.active_session_id(),
+                            }))
+                            .await;
+                    }
+                    let _ = self.release_session().await;
+                })
+                .await;
+                self.writer.drain_bounded().await;
+                std::process::exit(exit_code)
+            }
+            Interrupt::Lost(reason) => {
+                self.writer.drain_bounded().await;
+                eprintln!("Error: {reason}");
+                std::process::exit(1)
+            }
+        }
+    }
+
+    /// Route one link event to stdout. Returns the interrupt a closed bound session causes.
+    fn route_event(&self, event: LinkEvent) -> Option<Interrupt> {
         match event {
             LinkEvent::Session {
                 active_session_id,
@@ -556,7 +605,8 @@ impl RpcConnection {
                 };
                 let error = session_closed_error(reason);
                 if bound {
-                    return Some(Ending::Lost(error.to_string()));
+                    let completing = self.binding.lock().unwrap().completing;
+                    return (!completing).then(|| Interrupt::Lost(error.to_string()));
                 }
                 let mut output = self.output.lock().unwrap();
                 let frame = json!({
@@ -637,23 +687,24 @@ pub async fn run_daemon_attached_rpc_mode(options: DaemonRpcOptions) -> anyhow::
         binding: Mutex::new(Binding {
             active_session_id: String::new(),
             lifecycle,
+            completing: false,
             daemon_closing: None,
         }),
         output: Mutex::new(Output::default()),
     });
-    let (endings_tx, mut endings) = tokio::sync::mpsc::unbounded_channel::<Ending>();
+    let (interrupts_tx, mut interrupts) = tokio::sync::mpsc::unbounded_channel::<Interrupt>();
     {
         // The link answers requests only while its events are consumed,
         // so the consumer runs before the startup create.
         let connection = Arc::clone(&connection);
-        let endings_tx = endings_tx.clone();
+        let interrupts_tx = interrupts_tx.clone();
         tokio::spawn(async move {
             while let Some(event) = connection.link.next_event().await {
-                if let Some(ending) = connection.route_event(event) {
-                    let _ = endings_tx.send(ending);
+                if let Some(interrupt) = connection.route_event(event) {
+                    let _ = interrupts_tx.send(interrupt);
                 }
             }
-            let _ = endings_tx.send(Ending::Lost(
+            let _ = interrupts_tx.send(Interrupt::Lost(
                 "Lost connection to the Prime Agent daemon.".to_string(),
             ));
         });
@@ -692,7 +743,7 @@ pub async fn run_daemon_attached_rpc_mode(options: DaemonRpcOptions) -> anyhow::
     match attached {
         Ok(response) if response.success => {}
         failed => {
-            connection.release_session().await;
+            let _ = connection.release_session().await;
             anyhow::bail!(match failed {
                 Ok(response) => response
                     .error
@@ -707,14 +758,14 @@ pub async fn run_daemon_attached_rpc_mode(options: DaemonRpcOptions) -> anyhow::
         (tokio::signal::unix::SignalKind::hangup(), 129),
     ] {
         let mut signals = tokio::signal::unix::signal(kind)?;
-        let endings_tx = endings_tx.clone();
+        let interrupts_tx = interrupts_tx.clone();
         tokio::spawn(async move {
             if signals.recv().await.is_some() {
-                let _ = endings_tx.send(Ending::Signal { exit_code });
+                let _ = interrupts_tx.send(Interrupt::Signal { exit_code });
             }
         });
     }
-    drop(endings_tx);
+    drop(interrupts_tx);
 
     let mut handlers = tokio::task::JoinSet::new();
     let mut lane_tails: HashMap<Lane, tokio::sync::oneshot::Receiver<()>> = HashMap::new();
@@ -723,7 +774,7 @@ pub async fn run_daemon_attached_rpc_mode(options: DaemonRpcOptions) -> anyhow::
     let ending = loop {
         input_line.clear();
         tokio::select! {
-            Some(ending) = endings.recv() => break ending,
+            Some(interrupt) = interrupts.recv() => break Ending::Interrupted(interrupt),
             read = stdin.read_line(&mut input_line) => {
                 match read {
                     Ok(0) | Err(_) => break Ending::InputClosed,
@@ -756,40 +807,29 @@ pub async fn run_daemon_attached_rpc_mode(options: DaemonRpcOptions) -> anyhow::
     };
     match ending {
         Ending::InputClosed => {
-            while handlers.join_next().await.is_some() {}
-            let _ = connection
-                .send(json!({
-                    "type": "wait_for_idle",
-                    "activeSessionId": connection.active_session_id(),
-                }))
-                .await;
-            connection.release_session().await;
-            connection.writer.drain().await;
-            Ok(0)
-        }
-        Ending::Signal { exit_code } => {
-            // An owned session stops with this client: its turn settles
-            // aborted first. A promoted one keeps running in the daemon.
-            let owned =
-                connection.binding.lock().unwrap().lifecycle == DaemonSessionLifecycle::ClientOwned;
-            if owned {
-                let _ = connection
+            let settle = async {
+                while handlers.join_next().await.is_some() {}
+                connection
                     .send(json!({
-                        "type": "abort",
+                        "type": "wait_for_idle",
                         "activeSessionId": connection.active_session_id(),
                     }))
-                    .await;
+                    .await?;
+                connection.release_session().await?;
+                connection.writer.drain().await;
+                Ok::<(), String>(())
+            };
+            // Interrupts stay live through the settle. The settle wins a
+            // tie: its own request failures already report a loss.
+            tokio::select! {
+                biased;
+                settled = settle => match settled {
+                    Ok(()) => Ok(0),
+                    Err(reason) => connection.exit_on(Interrupt::Lost(reason)).await,
+                },
+                Some(interrupt) = interrupts.recv() => connection.exit_on(interrupt).await,
             }
-            connection.release_session().await;
-            connection.writer.drain_bounded().await;
-            // The stdin reader thread never returns on its own; the exit
-            // must not wait for the runtime to join it.
-            std::process::exit(exit_code)
         }
-        Ending::Lost(reason) => {
-            connection.writer.drain_bounded().await;
-            eprintln!("Error: {reason}");
-            std::process::exit(1)
-        }
+        Ending::Interrupted(interrupt) => connection.exit_on(interrupt).await,
     }
 }
