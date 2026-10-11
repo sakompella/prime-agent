@@ -279,6 +279,9 @@ pub fn kernel_provisioner(
         .map(|id| id.to_string_lossy().to_string())
         .unwrap_or_default();
     env.insert("RLM_SESSION_ID".to_string(), rlm_session_id);
+    // Always set, like RLM_SESSION_ID: an ephemeral session blanks harness dirs inherited
+    // from the process env (a run launched from another kernel). Empty reads as unset in
+    // the runtime, so its local writes fail instead of landing in the caller's store.
     for (key, value) in [
         ("RLM_SESSION_DIR", session_artifact_dir.clone()),
         (
@@ -286,9 +289,8 @@ pub fn kernel_provisioner(
             crate::refinement::get_local_harness_state_dir(session_artifact_dir.as_deref()),
         ),
     ] {
-        if let Some(value) = value {
-            env.insert(key.to_string(), value.to_string_lossy().to_string());
-        }
+        let value = value.map(|dir| dir.to_string_lossy().to_string());
+        env.insert(key.to_string(), value.unwrap_or_default());
     }
     if let Some(serper_api_key) = serper_api_key {
         env.insert("SERPER_API_KEY".to_string(), serper_api_key);
