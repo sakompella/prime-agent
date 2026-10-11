@@ -5,13 +5,15 @@
 //! the session's own artifact dir, the `<artifact-dir>/harness` the host reads
 //! for the harness digest (v0.9.8 parity). Covers a root session and an RLM
 //! child laid out the way the daemon writes children
-//! (`session-artifacts/<parent>/sub-<id>`).
+//! (`session-artifacts/<parent>/sub-<id>`), and an ephemeral session, which
+//! must refuse local writes instead of inheriting a caller's harness dirs.
 #![cfg(unix)]
 
 mod live_kernel;
 
 use std::path::Path;
 
+use live_kernel::SessionStore;
 use serde_json::{json, Value};
 
 const HARNESS_ENV_KEYS: [&str; 3] = [
@@ -67,8 +69,9 @@ async fn kernel_local_harness_resolves_to_the_session_artifact_dir() {
     let cwd = dir.path().join("project");
     std::fs::create_dir_all(&cwd).expect("project dir");
 
-    // No harness binding may leak in from the test's own env: a run inside a
-    // Prime kernel carries its own RLM_* values.
+    // The test process carries a caller's harness bindings, as a run inside
+    // a Prime kernel does; no session may inherit them.
+    let inherited = dir.path().join("inherited-session");
     let mut overrides = vec![
         (
             "PRIME_AGENT_KERNEL_PYTHON",
@@ -78,33 +81,39 @@ async fn kernel_local_harness_resolves_to_the_session_artifact_dir() {
         ("PRIME_API_KEY", None),
         ("RLM_DEPTH", None),
     ];
-    overrides.extend(HARNESS_ENV_KEYS.iter().map(|key| (*key, None)));
+    overrides.extend(
+        HARNESS_ENV_KEYS
+            .iter()
+            .map(|key| (*key, Some(inherited.display().to_string()))),
+    );
     let _env = live_kernel::EnvOverride::apply(&overrides);
 
     let root = live_kernel::run_cell(
         &agent_dir,
         &cwd,
-        &agent_dir.join("sessions"),
+        SessionStore::Persisted {
+            session_dir: &agent_dir.join("sessions"),
+        },
         None,
         &harness_cell(),
     )
     .await;
+    let root_artifacts = root.artifact_dir.expect("a persisted root session");
     assert_eq!(
         receipt(&root.details),
-        expected_receipt(&agent_dir, &root.artifact_dir)
+        expected_receipt(&agent_dir, &root_artifacts)
     );
     assert_eq!(
-        root.artifact_dir.parent(),
+        root_artifacts.parent(),
         Some(agent_dir.join("session-artifacts").as_path()),
         "root artifacts live at <agent-dir>/session-artifacts/<session>"
     );
     assert_eq!(
-        stored_local_memory_ids(&root.artifact_dir),
+        stored_local_memory_ids(&root_artifacts),
         vec!["slice1_local".to_string()]
     );
 
-    let parent_id = root
-        .artifact_dir
+    let parent_id = root_artifacts
         .file_name()
         .expect("the artifact dir names its session")
         .to_owned();
@@ -112,22 +121,52 @@ async fn kernel_local_harness_resolves_to_the_session_artifact_dir() {
     let child = live_kernel::run_cell(
         &agent_dir,
         &cwd,
-        &parent_artifacts.join("sub-0000abcd"),
+        SessionStore::Persisted {
+            session_dir: &parent_artifacts.join("sub-0000abcd"),
+        },
         Some(1),
         &harness_cell(),
     )
     .await;
+    let child_artifacts = child.artifact_dir.expect("a persisted child session");
     assert_eq!(
         receipt(&child.details),
-        expected_receipt(&agent_dir, &child.artifact_dir)
+        expected_receipt(&agent_dir, &child_artifacts)
     );
     assert_eq!(
-        child.artifact_dir.parent(),
+        child_artifacts.parent(),
         Some(parent_artifacts.join("session-artifacts").as_path()),
         "child artifacts live beside the child dirs, as in v0.9.8"
     );
     assert_eq!(
-        stored_local_memory_ids(&child.artifact_dir),
+        stored_local_memory_ids(&child_artifacts),
         vec!["slice1_local".to_string()]
+    );
+
+    let ephemeral = live_kernel::run_cell(
+        &agent_dir,
+        &cwd,
+        SessionStore::Ephemeral,
+        None,
+        &harness_cell(),
+    )
+    .await;
+    assert_eq!(ephemeral.artifact_dir, None);
+    // Empty values read as unset in the runtime, so the default local store
+    // refuses the write instead of landing in the caller's dirs.
+    assert_eq!(
+        receipt(&ephemeral.details),
+        json!({
+            "env": {
+                "RLM_GLOBAL_HARNESS_STATE_DIR": agent_dir.join("harness"),
+                "RLM_HARNESS_STATE_DIR": "",
+                "RLM_SESSION_DIR": "",
+            },
+            "write": "Local harness state requires RLM_HARNESS_STATE_DIR or RLM_SESSION_DIR. Use get_harness_state(global_=True) for global state. This session has no persistent local harness store; pass global_=True to persist across sessions.",
+        })
+    );
+    assert!(
+        !inherited.exists(),
+        "nothing may be written to the inherited harness dirs"
     );
 }

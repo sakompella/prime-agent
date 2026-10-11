@@ -71,40 +71,47 @@ impl Drop for EnvOverride {
     }
 }
 
-fn scripted_model() -> pa_agent::types::Model {
-    serde_json::from_value(json!({
+/// Where the session under test keeps its transcript.
+pub enum SessionStore<'a> {
+    /// Persisted under this session dir; the session gets an artifact dir.
+    Persisted { session_dir: &'a Path },
+    /// In memory only (`--no-session`); no artifact dir.
+    Ephemeral,
+}
+
+pub struct CellRun {
+    /// The session's artifact dir (`<session-dir parent>/session-artifacts/<id>`),
+    /// `None` for an ephemeral session.
+    pub artifact_dir: Option<PathBuf>,
+    /// The `details` of the cell's tool result.
+    pub details: Value,
+}
+
+/// Run `code` as the only tool call of one scripted turn.
+pub async fn run_cell(
+    agent_dir: &Path,
+    cwd: &Path,
+    store: SessionStore<'_>,
+    rlm_depth: Option<u32>,
+    code: &str,
+) -> CellRun {
+    let mut session = SessionManager::in_memory(cwd);
+    match store {
+        SessionStore::Persisted { session_dir } => {
+            std::fs::create_dir_all(session_dir).expect("session dir");
+            session.materialize_session_file(Some(session_dir.to_path_buf()));
+        }
+        SessionStore::Ephemeral => {}
+    }
+    let artifact_dir = session.get_session_artifact_dir();
+
+    let model: pa_agent::types::Model = serde_json::from_value(json!({
         "id": "faux-1", "name": "Faux", "api": "test", "provider": "faux",
         "baseUrl": "http://localhost", "reasoning": false,
         "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
         "contextWindow": 200_000, "maxTokens": 4_000
     }))
-    .expect("faux loop model")
-}
-
-pub struct CellRun {
-    /// The session's artifact dir (`<session-dir parent>/session-artifacts/<id>`).
-    pub artifact_dir: PathBuf,
-    /// The `details` of the cell's persisted tool result.
-    pub details: Value,
-}
-
-/// Run `code` as the only tool call of one scripted turn, in a session
-/// persisted under `session_dir`.
-pub async fn run_cell(
-    agent_dir: &Path,
-    cwd: &Path,
-    session_dir: &Path,
-    rlm_depth: Option<u32>,
-    code: &str,
-) -> CellRun {
-    std::fs::create_dir_all(session_dir).expect("session dir");
-    let mut session = SessionManager::in_memory(cwd);
-    session.materialize_session_file(Some(session_dir.to_path_buf()));
-    let artifact_dir = session
-        .get_session_artifact_dir()
-        .expect("a persisted session has an artifact dir");
-
-    let model = scripted_model();
+    .expect("faux loop model");
     let provider = std::sync::Arc::new(ScriptedProvider::new(model.clone()));
     provider.push_turn(ScriptedTurn::Events(tool_call_turn_steps(
         &model,
