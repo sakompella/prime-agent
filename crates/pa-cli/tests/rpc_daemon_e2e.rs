@@ -262,6 +262,57 @@ fn rpc_navigate_tree_rolls_the_session_back_in_place() {
     assert_eq!(after["data"]["sessionFile"], before["data"]["sessionFile"]);
 }
 
+/// A faux reply that streams for far longer than the lifecycle tests wait.
+fn slow_stream_script() -> Value {
+    json!({
+        "engine": "faux",
+        "tokensPerSecond": 2,
+        "responses": ["a reply that streams far slower than the test waits for it, word after word after word"],
+    })
+}
+
+/// Start a streaming turn, close stdin, and return once the stream has
+/// outlived the EOF: the EOF settle is then waiting on the running turn.
+fn spawn_settling_after_eof() -> RpcChild {
+    let mut client = RpcChild::spawn(&["--mode", "rpc"], &slow_stream_script());
+    let response = client.request(&json!({ "type": "prompt", "message": "go" }));
+    assert_eq!(response["success"], true, "{response}");
+    let assistant_update = |frame: &Value| {
+        frame["type"] == "message_update" && frame["message"]["role"] == "assistant"
+    };
+    client.wait_frame(assistant_update);
+    client.close_stdin();
+    client.wait_frame(assistant_update);
+    client
+}
+
+/// A signal still ends the process while the EOF settle waits on a streaming turn.
+#[cfg(unix)]
+#[test]
+fn rpc_sigterm_during_the_eof_settle_exits_143() {
+    let mut client = spawn_settling_after_eof();
+    let sent = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(client.child.id().to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(sent.success(), "the SIGTERM dispatch succeeded");
+    assert_eq!(client.wait_closed().code(), Some(143));
+}
+
+/// Losing the daemon while the EOF settle waits is a failure, never a clean exit.
+#[test]
+fn rpc_daemon_loss_during_the_eof_settle_exits_1() {
+    let mut client = spawn_settling_after_eof();
+    rpc_support::shutdown_sandboxed_daemon(&client.socket);
+    assert_eq!(client.wait_closed().code(), Some(1));
+    let stderr = client.stderr_text();
+    assert!(
+        stderr.starts_with("Error: "),
+        "the loss is reported: {stderr}"
+    );
+}
+
 /// `--extension` fails before any daemon work: no supervisor starts.
 #[test]
 fn rpc_rejects_extensions_before_any_daemon_work() {

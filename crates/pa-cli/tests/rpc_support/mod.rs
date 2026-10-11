@@ -166,6 +166,20 @@ impl RpcChild {
         self.child.wait().expect("the child exits")
     }
 
+    /// Read frames until stdout closes (the child exited), bounded by
+    /// [`TIMEOUT`]; returns the exit status.
+    pub fn wait_closed(&mut self) -> std::process::ExitStatus {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let timeout_left = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(timeout_left) {
+                Ok(_) => {}
+                Err(RecvTimeoutError::Disconnected) => return self.wait_exit(),
+                Err(RecvTimeoutError::Timeout) => panic!("the rpc child never exited"),
+            }
+        }
+    }
+
     /// The child's stderr so far (call after it exited).
     pub fn stderr_text(&mut self) -> String {
         let mut text = String::new();
