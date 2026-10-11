@@ -42,6 +42,9 @@ enum RpcRoute {
     SessionName,
     /// `clone`: fork at the current leaf, keeping it (`position: "at"`).
     Clone,
+    /// `get_fork_messages`: the active branch's user messages, the turns a
+    /// rollback keeps (v0.9.8 listed the whole session's).
+    ForkMessages,
     /// Attach a second session on this link and stream it as observed frames.
     Observe,
     Unobserve,
@@ -123,9 +126,7 @@ impl RpcRoute {
             "fork" => bound("fork", Answer::ForkSelection),
             "navigate_tree" => bound("navigate_tree", Answer::Data),
             "clone" => RpcRoute::Clone,
-            "get_fork_messages" => {
-                bound("get_user_messages_for_forking", Answer::Field("messages"))
-            }
+            "get_fork_messages" => RpcRoute::ForkMessages,
             "get_last_assistant_text" => bound("get_last_assistant_text", Answer::Field("text")),
             "set_session_name" => RpcRoute::SessionName,
             "get_messages" => bound("get_messages", Answer::Field("messages")),
@@ -178,6 +179,7 @@ impl RpcRoute {
             RpcRoute::Forward { .. }
             | RpcRoute::SessionName
             | RpcRoute::Clone
+            | RpcRoute::ForkMessages
             | RpcRoute::Unknown => None,
         }
     }
@@ -477,6 +479,14 @@ impl RpcConnection {
                     .map(|_| ResponseData::Absent)
                 }
             }
+            RpcRoute::ForkMessages => self
+                .send(json!({
+                    "type": "get_user_messages_for_forking",
+                    "activeSessionId": bound,
+                    "scope": "activeBranch",
+                }))
+                .await
+                .map(|data| Answer::Field("messages").shape(data)),
             RpcRoute::Clone => {
                 let leaf = self
                     .send(json!({ "type": "get_connection_state", "activeSessionId": bound }))
