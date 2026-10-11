@@ -53,9 +53,13 @@ async fn resolve_child_model_allowlisted(
 
 /// The `rlm.create_session` launch env (TS `createRlmRootSession`'s
 /// minimal map: `collectDaemonLaunchEnv({ PATH })` plus the provider's
-/// env API-key var plus `PRIME_TEAM_ID` for prime-inference).
+/// env API-key var plus `PRIME_TEAM_ID` for prime-inference), plus the
+/// parent worker's session-scoped vars so the new root reaches the same
+/// T3 connection as its parent.
 fn create_session_launch_env(model: &str) -> std::collections::BTreeMap<String, String> {
-    let mut env = std::collections::BTreeMap::new();
+    let mut env = pa_types::daemon::launch_env::session_scoped_env(
+        &pa_types::daemon::launch_env::collect_process_launch_env(),
+    );
     if let Ok(path) = std::env::var("PATH") {
         env.insert("PATH".to_string(), path);
     }
