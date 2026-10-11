@@ -121,6 +121,7 @@ impl RpcRoute {
             "get_session_stats" => bound("get_session_stats", Answer::Data),
             "export_html" => bound("export_html", Answer::Field("path")),
             "fork" => bound("fork", Answer::ForkSelection),
+            "navigate_tree" => bound("navigate_tree", Answer::Data),
             "clone" => RpcRoute::Clone,
             "get_fork_messages" => {
                 bound("get_user_messages_for_forking", Answer::Field("messages"))
