@@ -457,6 +457,11 @@ impl RpcConnection {
                     Err(error) => Err(error),
                 }
             }
+            // The bound session shares the link's one attachment for its id:
+            // observing it would let `unobserve` detach the main stream.
+            RpcRoute::Observe if payload["activeSessionId"] == bound.as_str() => Err(format!(
+                "Cannot observe the session this connection is bound to: {bound}"
+            )),
             RpcRoute::Observe => {
                 let target = payload["activeSessionId"].as_str().unwrap_or_default();
                 let observed = self.output.lock().unwrap().observed.contains_key(target);
