@@ -599,6 +599,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             can_spawn: config.rlm_subagent_host.is_some(),
             generic_mcp_servers,
             append_system_prompt: Some(resources.append_system_prompt.join("\n\n")),
+            t3_code: crate::T3Code::from_env(|key| std::env::var(key).ok()),
             ..Default::default()
         },
     );

@@ -70,7 +70,11 @@ fn test_options(
             max_variable_bytes: None,
             debounce_ms,
         }),
-        bootstrap_code: Some(build_rlm_bootstrap_code(&[], false)),
+        bootstrap_code: Some(build_rlm_bootstrap_code(
+            &[],
+            false,
+            pa_core::T3Code::Absent,
+        )),
         stderr_log_path: None,
         on_background_work_settled: None,
     })
@@ -202,7 +206,7 @@ async fn post_restore_auto_snapshot_skips_until_a_real_cell_changes_the_namespac
     let restore = reader.restore_state().await.expect("restore");
     assert!(restore.restored.iter().any(|name| name == "restored_var"));
 
-    let bootstrap_code = build_rlm_bootstrap_code(&[], false);
+    let bootstrap_code = build_rlm_bootstrap_code(&[], false, pa_core::T3Code::Absent);
     let bootstrap = reader
         .execute(&bootstrap_code, ExecuteOptions::default())
         .await
