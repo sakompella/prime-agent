@@ -17,6 +17,7 @@ use super::{
 };
 use crate::lease::is_process_alive;
 use crate::protocol::{response_failure, response_success, DaemonResponse};
+use pa_types::daemon::launch_env::SessionEnv;
 
 impl Supervisor {
     /// Complete a tombstoned stop for a worker encountered at adoption: adoption
@@ -109,6 +110,7 @@ impl Supervisor {
             telemetry_disabled,
             runtime_metadata,
             env,
+            launch_env,
             ..
         } = create
         else {
@@ -308,6 +310,13 @@ impl Supervisor {
         };
         let descriptor_path = self.descriptor_dir.join(format!("{worker_id}.json"));
         let resident = ResidentWorker::new(worker_id.clone(), descriptor, descriptor_path.clone());
+        if let Some(launch_env) = launch_env {
+            *resident
+                .session_env
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                SessionEnv::filter(launch_env);
+        }
         // Register the resident before spawning: the worker's boot self-registration must
         // find its identity in the registry (registration races the create replay).
         self.registry.insert(Arc::clone(&resident)).await;

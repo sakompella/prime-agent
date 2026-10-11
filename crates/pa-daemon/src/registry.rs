@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use pa_types::daemon::launch_env::SessionEnv;
 use pa_types::daemon::DaemonWorkerDescriptor;
 use serde_json::Value;
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -136,6 +137,9 @@ pub(crate) struct ResidentWorker {
     pub(crate) compaction: crate::compaction_supervision::CompactionSupervision,
     /// The pending owner-disconnect stop (TS `ownerCleanupTimer`).
     pub(crate) owner_cleanup: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+    /// The creating client's session env, applied to every spawn of this
+    /// worker. Memory only: it carries the T3 bearer token.
+    pub(crate) session_env: std::sync::Mutex<SessionEnv>,
 }
 
 /// The last-good heartbeats rows, tagged with the catalog generation they
@@ -183,6 +187,7 @@ impl ResidentWorker {
             connection_epoch: AtomicU64::new(0),
             compaction: crate::compaction_supervision::CompactionSupervision::default(),
             owner_cleanup: std::sync::Mutex::new(None),
+            session_env: std::sync::Mutex::default(),
         })
     }
 

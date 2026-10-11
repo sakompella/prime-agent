@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
+use pa_types::daemon::launch_env::SessionEnv;
 use pa_types::daemon::{DaemonCommand, DaemonSessionLifecycle};
 use serde_json::{json, Value};
 
@@ -212,7 +213,22 @@ impl Supervisor {
                     return Err(anyhow!(rejection));
                 }
                 match self.reuse_summary_or_holder(resident, &path_text).await? {
-                    ReuseAnswer::Summary(summary) => return Ok(Some(summary)),
+                    ReuseAnswer::Summary(summary) => {
+                        // The running process keeps its env; a later respawn takes the
+                        // newest client's (v0.9.8 `command.launchEnv ?? existing.launchEnv`).
+                        if let DaemonCommand::Create {
+                            launch_env: Some(launch_env),
+                            ..
+                        } = command
+                        {
+                            *resident
+                                .session_env
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                SessionEnv::filter(launch_env);
+                        }
+                        return Ok(Some(summary));
+                    }
                     // The routed resident went away with no successor: its teardown must
                     // settle, then the fresh classification re-checks the file (including any
                     // waitable successor).

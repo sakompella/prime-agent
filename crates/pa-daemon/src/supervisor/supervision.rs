@@ -11,6 +11,7 @@ use super::{
 };
 use crate::lease::is_process_alive;
 use crate::registry::WorkerRelay;
+use pa_types::daemon::launch_env::{is_session_scoped, SessionEnv};
 
 pub(super) const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 /// A crash-path child that lived at least this long proved health: its death resets
@@ -430,7 +431,17 @@ impl Supervisor {
         let stderr_log_path =
             crate::worker_stderr::log_path(&self.options.agent_dir, &resident.worker_id);
         let stderr_log = crate::worker_stderr::open_for_spawn(&stderr_log_path)?;
+        let session_env = resident
+            .session_env
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let mut command = Command::new(&executable);
+        scope_session_env(
+            command.as_std_mut(),
+            std::env::vars_os().map(|(key, _)| key),
+            &session_env,
+        );
         command
             .arg("worker")
             .envs(launch_env)
@@ -848,5 +859,49 @@ impl Supervisor {
             .store(peer_transport_capable, Ordering::SeqCst);
         pumps.installed = true;
         Ok(())
+    }
+}
+
+/// Give a worker exactly its session's env: the session-scoped vars the
+/// supervisor inherited from whichever client started it are removed first.
+fn scope_session_env(
+    command: &mut std::process::Command,
+    inherited_keys: impl IntoIterator<Item = std::ffi::OsString>,
+    session_env: &SessionEnv,
+) {
+    for key in inherited_keys {
+        if is_session_scoped(&key.to_string_lossy()) {
+            command.env_remove(key);
+        }
+    }
+    command.envs(session_env.vars());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::ffi::{OsStr, OsString};
+
+    use super::*;
+
+    #[test]
+    fn a_worker_gets_its_sessions_t3_env_instead_of_the_supervisors() {
+        let mut command = std::process::Command::new("worker");
+        let session_env = SessionEnv::filter(&BTreeMap::from([(
+            "T3_MCP_URL".to_string(),
+            "http://fresh".to_string(),
+        )]));
+        scope_session_env(
+            &mut command,
+            ["T3_STALE", "T3_MCP_URL", "PATH"].map(OsString::from),
+            &session_env,
+        );
+        assert_eq!(
+            command.get_envs().collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([
+                (OsStr::new("T3_MCP_URL"), Some(OsStr::new("http://fresh"))),
+                (OsStr::new("T3_STALE"), None),
+            ])
+        );
     }
 }

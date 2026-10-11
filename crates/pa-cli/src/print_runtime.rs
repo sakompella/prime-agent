@@ -241,7 +241,8 @@ fn daemon_session_create(
         runtime_metadata: None,
         lifecycle: Some(mode.lifecycle(options.session.no_session)),
         env: None,
-        launch_env: None,
+        launch_env: pa_types::daemon::launch_env::SessionEnv::collect(std::env::vars_os())
+            .into_wire(),
         rest: serde_json::Map::default(),
     };
     Ok((cwd, create))

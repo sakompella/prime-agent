@@ -216,6 +216,8 @@ pub enum DaemonCommand {
         /// Allowlisted client env vars (`env`), carried on create only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env: Option<std::collections::BTreeMap<String, String>>,
+        /// The client's session-scoped env (`launch_env::SessionEnv`),
+        /// applied to the session's worker process.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         launch_env: Option<std::collections::BTreeMap<String, String>>,
         #[serde(flatten)]

@@ -1413,6 +1413,7 @@ version = "0.10.0"
 dependencies = [
  "anyhow",
  "libc",
+ "proptest",
  "regex",
  "serde",
  "serde_json",
