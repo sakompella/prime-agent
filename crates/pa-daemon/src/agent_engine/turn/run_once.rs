@@ -298,22 +298,26 @@ impl AgentSessionEngine {
                             AgentEvent::ToolExecutionProgress { .. } => {}
                             AgentEvent::ToolExecutionUpdate {
                                 tool_call_id,
+                                tool_name,
+                                args,
                                 partial_result,
-                                ..
                             } => {
                                 let _ = tx.send(EngineEvent::ToolExecutionUpdate {
                                     tool_call_id: tool_call_id.clone(),
+                                    tool_name: tool_name.clone(),
+                                    args: args.clone(),
                                     partial_result: tool_result_wire_value(partial_result),
                                 });
                             }
                             AgentEvent::ToolExecutionEnd {
                                 tool_call_id,
+                                tool_name,
                                 result,
                                 is_error,
-                                ..
                             } => {
                                 let _ = tx.send(EngineEvent::ToolExecutionEnd {
                                     tool_call_id: tool_call_id.clone(),
+                                    tool_name: tool_name.clone(),
                                     result: tool_result_wire_value(result),
                                     is_error: *is_error,
                                 });

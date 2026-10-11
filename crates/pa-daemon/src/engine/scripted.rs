@@ -413,6 +413,7 @@ impl SessionEngine for ScriptedEngine {
             }
             if !emit(EngineEvent::ToolExecutionEnd {
                 tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
                 result: json!({
                     "content": [{ "type": "text", "text": result_text.clone() }],
                     "details": Value::Null,

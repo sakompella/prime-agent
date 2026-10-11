@@ -124,7 +124,9 @@ pub(crate) async fn execute_prepared_tool_call(
     let update_tx_for_callback = update_tx.clone();
 
     let tool_call_id = prepared.tool_call.id.clone();
-    let tool_name = prepared.tool.name().to_string();
+    // The call's own name, as on the start and end events: an alias call
+    // (a legacy `ipython`) must not change name mid-cell.
+    let tool_name = prepared.tool_call.name.clone();
     let args = prepared.tool_call.arguments.clone();
     let sink = Arc::clone(emit);
     let started_at = std::time::Instant::now();

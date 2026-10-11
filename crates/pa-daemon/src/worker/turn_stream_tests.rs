@@ -281,6 +281,7 @@ async fn a_turns_tool_executions_count_onto_the_summary() {
             },
             EngineEvent::ToolExecutionEnd {
                 tool_call_id: "t1".to_string(),
+                tool_name: "bash".to_string(),
                 result: Value::Null,
                 is_error: false,
             },
