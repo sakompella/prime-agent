@@ -282,6 +282,59 @@ fn rpc_navigate_tree_rolls_the_session_back_in_place() {
     assert_eq!(after["data"]["sessionFile"], before["data"]["sessionFile"]);
 }
 
+/// The faux turns of a session whose kernel reports its `T3_PROBE`.
+fn t3_probe_script() -> Value {
+    json!({ "engine": "faux", "responses": [
+        ipython_call("import os\nprint(repr(os.environ.get('T3_PROBE')))"),
+        { "text": "probed" },
+    ] })
+}
+
+/// Prompt a [`t3_probe_script`] session; returns what its kernel printed.
+fn kernel_t3_probe(client: &mut RpcChild) -> String {
+    let response = client.request(&json!({ "type": "prompt", "message": "probe" }));
+    assert_eq!(response["success"], true, "{response}");
+    let (result, _) = client.wait_frame(|frame| {
+        frame["type"] == "message_end" && frame["message"]["role"] == "toolResult"
+    });
+    first_text(&result["message"]).trim().to_string()
+}
+
+/// The supervisor inherits the env of the client that started it; a
+/// session's kernel must still see only its own client's `T3_*` env.
+#[test]
+fn rpc_session_kernel_sees_only_its_clients_t3_env() {
+    if kernel_python().is_none() {
+        return;
+    }
+    let mut starter =
+        RpcChild::spawn_configured(&["--mode", "rpc"], &t3_probe_script(), |_, command| {
+            command.env("T3_PROBE", "stale");
+        });
+    let state = starter.request(&json!({ "type": "get_state" }));
+    assert_eq!(state["success"], true, "the daemon is up: {state}");
+    let mut fresh = starter.join(
+        "fresh-script.json",
+        &["--mode", "rpc"],
+        &t3_probe_script(),
+        |_, command| {
+            command.env("T3_PROBE", "fresh");
+        },
+    );
+    let mut bare = starter.join(
+        "bare-script.json",
+        &["--mode", "rpc"],
+        &t3_probe_script(),
+        |_, command| {
+            command.env_remove("T3_PROBE");
+        },
+    );
+    assert_eq!(
+        (kernel_t3_probe(&mut fresh), kernel_t3_probe(&mut bare)),
+        ("'fresh'".to_string(), "None".to_string())
+    );
+}
+
 /// A faux reply that streams for far longer than the lifecycle tests wait.
 fn slow_stream_script() -> Value {
     json!({
