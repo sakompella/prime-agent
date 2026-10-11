@@ -521,6 +521,36 @@ mod tests {
         }
     }
 
+    proptest! {
+        /// A reload takes the file's last entry as the leaf: after every move
+        /// it lands on the live leaf and branch, and the live session sits on
+        /// the move's target.
+        #[test]
+        fn a_navigated_leaf_survives_a_reload(
+            shape in prop::collection::vec(
+                (prop::option::of(any::<prop::sample::Index>()), any::<bool>(), any::<bool>()),
+                1..16,
+            ),
+            moves in prop::collection::vec(prop::option::of(any::<prop::sample::Index>()), 1..6),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut store, ids) = random_tree(&shape);
+            store.set_path(dir.path().join("s.jsonl"));
+            store.rewrite().unwrap();
+            for target in moves {
+                let target = target.map(|target| ids[target.index(ids.len())].as_str());
+                store.navigate_to(target).unwrap();
+                prop_assert_eq!(store.tree_position(), target);
+                let reopened = SessionFile::open(&store.path).unwrap();
+                let branch_ids = |store: &SessionFile| -> Vec<String> {
+                    store.branch().iter().map(|entry| entry.id.clone()).collect()
+                };
+                prop_assert_eq!(reopened.leaf_id(), store.leaf_id());
+                prop_assert_eq!(branch_ids(&reopened), branch_ids(&store));
+            }
+        }
+    }
+
     #[test]
     fn branch_to_moves_leaf_and_validates() {
         let (_dir, mut store) = temp_store();

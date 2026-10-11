@@ -138,19 +138,23 @@ fn message_texts(response: &serde_json::Value) -> Vec<String> {
         .as_array()
         .expect("messages")
         .iter()
-        .map(|message| match message["content"].as_str() {
-            Some(text) => text.to_string(),
-            None => message["content"]
-                .as_array()
-                .map(|blocks| {
-                    blocks
-                        .iter()
-                        .filter_map(|b| b["text"].as_str())
-                        .collect::<String>()
-                })
-                .unwrap_or_default(),
-        })
+        .map(content_text)
         .collect()
+}
+
+fn content_text(message: &serde_json::Value) -> String {
+    match message["content"].as_str() {
+        Some(text) => text.to_string(),
+        None => message["content"]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<String>()
+            })
+            .unwrap_or_default(),
+    }
 }
 
 fn scripted_turn(client: &mut Client, session_id: &str, message: &str, id: &str) {
@@ -417,6 +421,118 @@ fn session_tree_commands_over_the_supervisor_wire() {
         "the fork wrote a new session file: {} files",
         session_files.len()
     );
+}
+
+/// Reopen the session file from disk, as a resume or a revival does: it
+/// must land on the live session's leaf and context.
+fn assert_a_reload_matches_the_live_session(
+    client: &mut Client,
+    session_id: &str,
+    session_file: &std::path::Path,
+    id: &str,
+) {
+    client.send_command(
+        &format!("{id}-tree"),
+        &serde_json::json!({ "type": "get_session_tree", "activeSessionId": session_id }),
+    );
+    let tree = client.read_response(&format!("{id}-tree"));
+    client.send_command(
+        &format!("{id}-messages"),
+        &serde_json::json!({ "type": "get_messages", "activeSessionId": session_id }),
+    );
+    let live_texts = message_texts(&client.read_response(&format!("{id}-messages")));
+    let reopened = pa_daemon::session_store::SessionFile::open(session_file).expect("reopen");
+    let reopened_texts: Vec<String> = reopened
+        .branch()
+        .iter()
+        .filter(|entry| entry.type_ == "message")
+        .map(|entry| content_text(&entry.fields["message"]))
+        .collect();
+    assert_eq!(
+        (reopened.leaf_id(), reopened_texts),
+        (tree["data"]["leafId"].as_str(), live_texts),
+        "{id}: the reloaded leaf and context"
+    );
+}
+
+/// A plain move (no summary, no label) only moved the in-memory leaf before:
+/// a reload took the file's last entry and brought the abandoned turn back.
+#[test]
+fn a_plain_tree_move_survives_a_reload() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("agent dir");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let (mut client, _hello) = Client::connect(&socket);
+    let script_path = dir.path().join("script.json");
+    std::fs::write(
+        &script_path,
+        serde_json::json!({ "responses": [
+            { "text": "first answer", "delayMs": 10 },
+            { "text": "second answer", "delayMs": 10 },
+        ] })
+        .to_string(),
+    )
+    .expect("write script");
+    client.send_command(
+        "c1",
+        &serde_json::json!({
+            "type": "create",
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": session_dir.to_string_lossy(),
+                "script": script_path.to_string_lossy(),
+            },
+        }),
+    );
+    let created = client.read_response("c1");
+    assert_eq!(created["success"], true, "create failed: {created}");
+    let session_id = created["data"]["id"]
+        .as_str()
+        .or_else(|| created["data"]["sessionId"].as_str())
+        .expect("session id")
+        .to_string();
+    scripted_turn(&mut client, &session_id, "first question", "p1");
+    scripted_turn(&mut client, &session_id, "second question", "p2");
+    client.send_command(
+        "f0",
+        &serde_json::json!({
+            "type": "get_user_messages_for_forking",
+            "activeSessionId": session_id,
+        }),
+    );
+    let forks = client.read_response("f0");
+    let user_entry = |index: usize| {
+        forks["data"]["messages"][index]["entryId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("user entry {index}: {forks}"))
+            .to_string()
+    };
+    let (first_user_id, second_user_id) = (user_entry(0), user_entry(1));
+    let session_file = std::fs::read_dir(&session_dir)
+        .expect("read session dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .expect("the session file");
+
+    // Before the second prompt, then before the first: the root user message
+    // leaves no entry to stand on.
+    for (id, target) in [("n1", &second_user_id), ("n2", &first_user_id)] {
+        client.send_command(
+            id,
+            &serde_json::json!({
+                "type": "navigate_tree",
+                "activeSessionId": session_id,
+                "targetId": target,
+            }),
+        );
+        let navigated = client.read_response(id);
+        assert_eq!(navigated["success"], true, "{id} failed: {navigated}");
+        assert_a_reload_matches_the_live_session(&mut client, &session_id, &session_file, id);
+    }
 }
 
 struct WorkerClient {
