@@ -43,7 +43,9 @@ pub fn t3_fork_capabilities(version: &str) -> Value {
     })
 }
 
-pub const T3_FORK_CONTRACT: u32 = 1;
+/// 2: the Python tool is `python_repl` (upstream #3400); contract 1 clients
+/// render only `ipython` cells.
+pub const T3_FORK_CONTRACT: u32 = 2;
 
 /// Every command [`RpcRoute::of`] routes; a new route joins this list.
 const RPC_COMMANDS: &[&str] = &[
