@@ -28,7 +28,7 @@ fn capabilities_report_the_fork_and_its_rpc_contract() {
     assert_eq!(lines.len(), 1, "one JSON line: {stdout:?}");
     let capabilities: Value = serde_json::from_str(lines[0]).expect("JSON");
     assert_eq!(capabilities["fork"], "t3fork", "{capabilities}");
-    assert_eq!(capabilities["contract"], 1, "{capabilities}");
+    assert_eq!(capabilities["contract"], 2, "{capabilities}");
     assert_eq!(
         capabilities["version"],
         env!("CARGO_PKG_VERSION"),
