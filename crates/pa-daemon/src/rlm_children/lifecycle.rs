@@ -346,6 +346,34 @@ impl SupervisorChildSessionsInner {
         Ok(())
     }
 
+    /// Persist a settled run's verdict on the child's display file
+    /// (`completed`, `error` or `cancelled`), so a display still reading
+    /// `running` means the run was interrupted without a verdict: the
+    /// daemon died, or the parent's shutdown closed it. A restarted parent
+    /// resumes exactly those (`resume_interrupted_children`).
+    pub(super) async fn record_settled_display(&self, record: &Arc<Mutex<ChildRecord>>) {
+        let (session_dir, child_id, status) = {
+            let record = record.lock().await;
+            // A parent close (its shutdown, kill or delete) is no verdict on
+            // the run: a shutdown-closed run stays resumable.
+            if record.closed_by_parent {
+                return;
+            }
+            let status = match record.settled_status {
+                Some("done") => "completed",
+                Some("error") => "error",
+                Some("cancelled") => "cancelled",
+                _ => return,
+            };
+            (
+                record.session_dir.clone(),
+                record.rlm_child_id.clone(),
+                status,
+            )
+        };
+        settle_display(session_dir, child_id, status).await;
+    }
+
     /// The child's live session summary (`get_state`): the busy verdict,
     /// the note, and the tool count read one round trip.
     pub(super) async fn child_state(&self, active_session_id: &str) -> Result<Value> {
@@ -395,11 +423,16 @@ impl SupervisorChildSessionsInner {
             return;
         }
         // The child's own descendants keep it busy (`child_busy`), so the
-        // wait holds until they settle too.
+        // wait holds until they settle too. The worker answers at the
+        // budget: an unbounded wait would outlive this link request and
+        // keep holding one of the child worker's in-flight slots, and a
+        // child busy for hours runs out of slots (every later request
+        // then reads as unreachable).
         let command = DaemonCommand::WaitForIdle {
             id: None,
             active_session_id: active_session_id.to_string(),
             wait_for_rlm_quiescence: Some(true),
+            timeout_ms: Some(budget.as_millis() as u64),
             rest: Map::default(),
         };
         let _ = self
@@ -555,33 +588,7 @@ impl SupervisorChildSessionsInner {
                 // notice's follow-up turn mints its own request.
                 self.record_child_return(record).await;
                 self.emit_child_update(record).await;
-                // Only a successful run completes the display (TS
-                // `completeRlmSubagentRuntime`); a cancelled or failed run
-                // stays `running`, which a restart relists as `error`.
-                let completed = {
-                    let record = record.lock().await;
-                    (record.settled_status == Some("done"))
-                        .then(|| (record.session_dir.clone(), record.rlm_child_id.clone()))
-                };
-                if let Some((session_dir, child_id)) = completed {
-                    if let Err(error) = tokio::task::spawn_blocking(move || {
-                        let Some(mut display) =
-                            crate::rlm_ledger::read_rlm_subagent_display(Path::new(&session_dir))
-                        else {
-                            return Ok(());
-                        };
-                        if display.child_id != child_id || display.status != "running" {
-                            return Ok(());
-                        }
-                        display.status = "completed".to_string();
-                        crate::rlm_ledger::write_rlm_subagent_display(&display).map(|_| ())
-                    })
-                    .await
-                    .unwrap_or_else(|error| Err(anyhow!(error)))
-                    {
-                        eprintln!("pa-daemon: RLM child display completion failed: {error:#}");
-                    }
-                }
+                self.record_settled_display(record).await;
                 self.deliver_settle_notice(record).await;
                 // A settled child releases an owed goal continuation.
                 self.fire_settle_hook(record).await;
@@ -595,6 +602,23 @@ impl SupervisorChildSessionsInner {
             } else {
                 unreachable_polls += 1;
                 if unreachable_polls >= WATCH_MAX_UNREACHABLE_POLLS {
+                    // Unreachable must mean dead: a worker that stopped
+                    // answering may still run its turn and write files, and
+                    // the failure notice below invites the parent to start a
+                    // replacement. Stop it before the notice.
+                    // `Killed` is the plain kill: when the worker does not
+                    // take it in time the supervisor escalates to signals,
+                    // and the worker's kernel exits with the worker.
+                    if record.lock().await.settled_status.is_none() {
+                        if let Err(error) = self
+                            .kill_child(&active_session_id, ChildCloseReason::Killed)
+                            .await
+                        {
+                            eprintln!(
+                                "pa-daemon: stopping unreachable RLM child session {active_session_id} failed: {error:#}"
+                            );
+                        }
+                    }
                     // A dead child keeps whatever rows its file already
                     // holds; capture them before the terminal notice.
                     self.emit_final_child_usage(record).await;
@@ -801,6 +825,7 @@ impl SupervisorChildSessionsInner {
             message
         };
         self.emit_child_update(record).await;
+        self.record_settled_display(record).await;
         // TS records a failed child's return too (`recordChildReturned` in
         // the thrown-run arm): a child that committed requests before
         // failing still returns them; a zero-commit child records nothing.
@@ -853,6 +878,29 @@ impl SupervisorChildSessionsInner {
                 "pa-daemon: RLM child terminal notice was not delivered to the parent session: {error:#}"
             );
         }
+    }
+}
+
+/// Move a child's display file from `running` to a terminal `status`; a
+/// display that already left `running` (or belongs to another child id)
+/// keeps its status.
+pub(super) async fn settle_display(session_dir: String, child_id: String, status: &'static str) {
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        let Some(mut display) =
+            crate::rlm_ledger::read_rlm_subagent_display(Path::new(&session_dir))
+        else {
+            return Ok(());
+        };
+        if display.child_id != child_id || display.status != "running" {
+            return Ok(());
+        }
+        display.status = status.to_string();
+        crate::rlm_ledger::write_rlm_subagent_display(&display).map(|_| ())
+    })
+    .await
+    .unwrap_or_else(|error| Err(anyhow!(error)))
+    {
+        eprintln!("pa-daemon: RLM child display settle failed: {error:#}");
     }
 }
 

@@ -12,6 +12,8 @@ pub const RLM_CHILD_FAILURE_CUSTOM_TYPE: &str = "rlm_child_failure";
 /// A child run that ended without an explicit reply or was cancelled
 /// (TS `rlm_child_terminal_notice`).
 pub const RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE: &str = "rlm_child_terminal_notice";
+/// The children a restarted parent found interrupted, and what became of each.
+pub const RLM_CHILDREN_RESUMED_CUSTOM_TYPE: &str = "rlm_children_resumed";
 
 /// How a child run ended without an explicit reply (TS
 /// `RlmChildTerminalNoticeDetails`).
@@ -86,6 +88,89 @@ pub fn create_rlm_child_terminal_notice(
         content: UserContent::Text(content),
         display: true,
         details: Some(details),
+        timestamp,
+        rest: serde_json::Map::default(),
+    }
+}
+
+/// What a restarted parent did with one child whose run a restart interrupted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildResumeOutcome {
+    /// The child got the continuation prompt.
+    Resumed,
+    /// The child's worker was still running its turn; the parent watches it again.
+    StillRunning,
+    /// The child could not be resumed, with the reason.
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildResume {
+    pub child_id: String,
+    pub session_name: String,
+    pub session_dir: String,
+    pub outcome: ChildResumeOutcome,
+}
+
+/// The one row a restarted parent receives about its interrupted children:
+/// `[children-resumed]`, then one line per child with its session dir.
+#[must_use]
+pub fn create_rlm_children_resumed_notice(
+    children: &[ChildResume],
+    timestamp: u64,
+) -> CustomMessage {
+    let line = |child: &ChildResume, state: &str| {
+        format!(
+            "- {} ({state}): {}",
+            sanitize_message_header_value(&child.session_name),
+            child.session_dir
+        )
+    };
+    let mut resumed = Vec::new();
+    let mut failed = Vec::new();
+    for child in children {
+        match &child.outcome {
+            ChildResumeOutcome::Resumed => resumed.push(line(child, "resumed")),
+            ChildResumeOutcome::StillRunning => resumed.push(line(child, "still running")),
+            ChildResumeOutcome::Failed(error) => {
+                failed.push(line(child, &format!("not resumed: {error}")));
+            }
+        }
+    }
+    let mut content =
+        "[children-resumed]\n\nA restart interrupted these subagents mid-run.".to_string();
+    if !resumed.is_empty() {
+        content.push_str(
+            " These continue from their saved transcripts and report back as usual; do not start replacements:\n",
+        );
+        content.push_str(&resumed.join("\n"));
+    }
+    if !failed.is_empty() {
+        content.push_str("\n\nThese could not be resumed; restart them if you still need them:\n");
+        content.push_str(&failed.join("\n"));
+    }
+    let details: Vec<_> = children
+        .iter()
+        .map(|child| {
+            let (outcome, error) = match &child.outcome {
+                ChildResumeOutcome::Resumed => ("resumed", None),
+                ChildResumeOutcome::StillRunning => ("still_running", None),
+                ChildResumeOutcome::Failed(error) => ("failed", Some(error)),
+            };
+            json!({
+                "childId": child.child_id,
+                "sessionName": child.session_name,
+                "sessionDir": child.session_dir,
+                "outcome": outcome,
+                "error": error,
+            })
+        })
+        .collect();
+    CustomMessage {
+        custom_type: RLM_CHILDREN_RESUMED_CUSTOM_TYPE.to_string(),
+        content: UserContent::Text(content),
+        display: true,
+        details: Some(json!({ "children": details })),
         timestamp,
         rest: serde_json::Map::default(),
     }

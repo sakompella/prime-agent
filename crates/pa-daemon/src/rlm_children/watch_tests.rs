@@ -911,10 +911,10 @@ async fn child_updates_surface_through_the_sink() {
     );
 }
 
-/// A cancelled run's watcher settle leaves the display `running`, so a
-/// restart relists the child as `error` instead of `completed`.
+/// A cancelled run records its verdict, so a restarted parent neither
+/// relists it `completed` nor resumes it as interrupted.
 #[tokio::test]
-async fn a_cancelled_child_keeps_its_display_running_through_the_watcher_settle() {
+async fn a_cancelled_child_records_its_cancel_through_the_watcher_settle() {
     let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
     let (sessions, _kill_rx) =
         sessions_with_fake_supervisor(follow_up_tx, 500, FakeKill::Success, FakeChild::Healthy)
@@ -943,7 +943,7 @@ async fn a_cancelled_child_keeps_its_display_running_through_the_watcher_settle(
     }
     let display = crate::rlm_ledger::read_rlm_subagent_display(Path::new(&handle.session_dir))
         .expect("display entry stays readable");
-    assert_eq!(display.status, "running");
+    assert_eq!(display.status, "cancelled");
 }
 
 /// The `follow_up` carries exactly the TS failure row (`createRlmChildFailureMessage`).
@@ -1011,7 +1011,7 @@ async fn an_unreachable_child_delivers_the_failure_notice_instead_of_no_reply() 
         }
     });
     let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
-    let (sessions, _kill_rx) =
+    let (sessions, mut kill_rx) =
         sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::Unreachable)
             .await;
     let handle = spawn_child(&sessions).await;
@@ -1022,6 +1022,16 @@ async fn an_unreachable_child_delivers_the_failure_notice_instead_of_no_reply() 
         .expect("the unreachable child must deliver its failure notice")
         .expect("follow_up channel open");
     assert_failure_row(&follow_up, &handle.rlm_child_id, "Child worker unreachable");
+    // Unreachable means dead: the child was stopped with a plain kill (the
+    // supervisor escalates it to signals) before the parent heard of it.
+    let kill = kill_rx
+        .try_recv()
+        .expect("the unreachable child is killed before its failure notice");
+    assert_eq!(kill["activeSessionId"], "child-live");
+    assert!(
+        kill.get("rlmCloseReason").is_none() && kill.get("rlmLedgerDelete").is_none(),
+        "the stop is a plain kill: {kill}"
+    );
     // Exactly one failure row lands: the give-up claims once.
     let extra = tokio::time::timeout(Duration::from_millis(300), follow_up_rx.recv()).await;
     assert!(extra.is_err(), "no second notice may arrive");
@@ -2718,4 +2728,170 @@ async fn the_unreachable_give_up_skips_the_exit_capture_when_a_capture_stands() 
     assert_eq!(record.answer_preview.as_deref(), Some("the captured say"));
     assert_eq!(record.answer_text.as_deref(), Some("the captured say"));
     assert!(record.answer_captured);
+}
+
+/// A restarted parent (its reseed) resumes the children whose run a restart
+/// interrupted recently, leaves stale and finished ones alone, sends the
+/// parent one notice naming each resumed child with its session dir, and
+/// watches the resumed run to its verdict.
+#[tokio::test]
+async fn a_restarted_parent_resumes_its_recently_interrupted_children() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent = tmp.path().join("agent");
+    let daemon_sessions = tmp.path().join("daemon-sessions");
+    let socket = std::env::temp_dir().join(format!(
+        "pa-rlm-resume-{}.sock",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+    let (kill_tx, _kill_rx) = mpsc::unbounded_channel();
+    spawn_fake_supervisor(
+        socket.clone(),
+        follow_up_tx,
+        0,
+        kill_tx,
+        FakeSupervisorScript {
+            kill: FakeKill::Success,
+            child: FakeChild::Healthy,
+            child_subagents: Arc::new(FakeChildSubagents::default()),
+            peers: Arc::new(std::sync::Mutex::new(Vec::new())),
+        },
+    )
+    .await;
+    let sessions = SupervisorChildSessions::new(
+        Arc::new(crate::supervisor_link::SupervisorLink::new(socket.clone())),
+        agent.clone(),
+        "parent-live".to_string(),
+        std::sync::Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+            agent.clone(),
+            /*telemetry_disabled*/ true,
+        )),
+        String::new(),
+    );
+    crate::descriptor::persist_supervisor_config(
+        &crate::descriptor::descriptor_dir(&agent, &socket)
+            .join(crate::descriptor::SUPERVISOR_CONFIG_FILE_NAME),
+        &crate::descriptor::PersistedSupervisorConfig {
+            version: 1,
+            socket_path: socket.to_string_lossy().to_string(),
+            default_session_dir: Some(daemon_sessions.display().to_string()),
+        },
+    )
+    .unwrap();
+    let session_file = |path: std::path::PathBuf| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"id\":\"s\",\"timestamp\":\"2026-10-25T00:00:00.000Z\",\"cwd\":\"/tmp\",\"version\":3}\n",
+        )
+        .unwrap();
+        path
+    };
+    let parent = session_file(daemon_sessions.join("P.jsonl"));
+    let mut ledger_lines = vec![r#"{"v":1,"op":"meta","at":"2026-10-25T00:00:00Z"}"#.to_string()];
+    for (child_id, status) in [
+        ("sub-run", "running"),
+        ("sub-stale", "running"),
+        ("sub-done", "completed"),
+    ] {
+        let child = session_file(agent.join(format!(
+            "session-artifacts/P/{child_id}/sess-{child_id}.jsonl"
+        )));
+        crate::rlm_ledger::write_rlm_subagent_display(
+            &crate::rlm_ledger::RlmSubagentDisplayEntry {
+                type_tag: "rlm_subagent".to_string(),
+                child_id: child_id.to_string(),
+                session_name: child_id.to_string(),
+                session_dir: child.parent().unwrap().display().to_string(),
+                session_file: child.display().to_string(),
+                rlm_parent_node_id: None,
+                prompt: None,
+                spawn_code: None,
+                model: None,
+                status: status.to_string(),
+                created_at: 1234,
+            },
+        )
+        .unwrap();
+        if child_id == "sub-stale" {
+            let interrupted_long_ago = std::time::SystemTime::now()
+                - (super::resume::RESUME_WINDOW + Duration::from_secs(60));
+            std::fs::File::options()
+                .write(true)
+                .open(&child)
+                .unwrap()
+                .set_modified(interrupted_long_ago)
+                .unwrap();
+        }
+        ledger_lines.push(format!(
+            r#"{{"v":1,"op":"spawn","at":"2026-10-25T00:00:00Z","childId":"{child_id}","parent":"{}","child":"{}","depth":1,"name":"{child_id}"}}"#,
+            parent.display(),
+            child.display()
+        ));
+    }
+    let ledger_path = crate::rlm_ledger::rlm_ledger_path(&agent, &daemon_sessions);
+    std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
+    std::fs::write(ledger_path, ledger_lines.join("\n")).unwrap();
+    sessions.set_identity(ParentIdentity {
+        session_file: Some(parent.display().to_string()),
+        ..ParentIdentity::with_default_depth()
+    });
+
+    let interrupted = sessions.reseed_from_ledger().await;
+    sessions.resume_interrupted(interrupted);
+
+    let run_dir = agent.join("session-artifacts/P/sub-run");
+    let notice = loop {
+        let follow_up = tokio::time::timeout(Duration::from_secs(30), follow_up_rx.recv())
+            .await
+            .expect("the parent hears about its interrupted children")
+            .expect("follow_up channel open");
+        if follow_up["customMessage"]["customType"] == "rlm_children_resumed" {
+            break follow_up;
+        }
+    };
+    let custom = &notice["customMessage"];
+    assert_eq!(
+        custom["details"]["children"],
+        json!([{
+            "childId": "sub-run",
+            "sessionName": "sub-run",
+            "sessionDir": run_dir.display().to_string(),
+            "outcome": "resumed",
+            "error": null,
+        }])
+    );
+    assert!(
+        custom["content"]
+            .as_str()
+            .is_some_and(|text| text.contains(&run_dir.display().to_string())),
+        "the notice names the session dir: {custom}"
+    );
+    // The resumed run is watched again: against the idle fake it settles,
+    // and its display records the verdict.
+    let display_status = |child_id: &str| {
+        crate::rlm_ledger::read_rlm_subagent_display(
+            &agent.join(format!("session-artifacts/P/{child_id}")),
+        )
+        .unwrap()
+        .status
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while display_status("sub-run") != "completed" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the resumed run settles and records its verdict");
+    assert_eq!(
+        display_status("sub-stale"),
+        "running",
+        "a stale interruption is not resumed"
+    );
+    let roster = sessions.list_subagents().await.unwrap();
+    let stale = roster
+        .iter()
+        .find(|row| row.rlm_child_id == "sub-stale")
+        .unwrap();
+    assert_eq!(stale.status, "error");
 }
