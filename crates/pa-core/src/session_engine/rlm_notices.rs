@@ -100,6 +100,9 @@ pub enum ChildResumeOutcome {
     Resumed,
     /// The child's worker was still running its turn; the parent watches it again.
     StillRunning,
+    /// The child finished its run before the parent came back; only its
+    /// result is owed.
+    Finished,
     /// The child could not be resumed, with the reason.
     Failed(String),
 }
@@ -132,6 +135,7 @@ pub fn create_rlm_children_resumed_notice(
         match &child.outcome {
             ChildResumeOutcome::Resumed => resumed.push(line(child, "resumed")),
             ChildResumeOutcome::StillRunning => resumed.push(line(child, "still running")),
+            ChildResumeOutcome::Finished => resumed.push(line(child, "finished")),
             ChildResumeOutcome::Failed(error) => {
                 failed.push(line(child, &format!("not resumed: {error}")));
             }
@@ -155,6 +159,7 @@ pub fn create_rlm_children_resumed_notice(
             let (outcome, error) = match &child.outcome {
                 ChildResumeOutcome::Resumed => ("resumed", None),
                 ChildResumeOutcome::StillRunning => ("still_running", None),
+                ChildResumeOutcome::Finished => ("finished", None),
                 ChildResumeOutcome::Failed(error) => ("failed", Some(error)),
             };
             json!({

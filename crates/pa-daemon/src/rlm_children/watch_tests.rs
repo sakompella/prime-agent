@@ -1037,6 +1037,41 @@ async fn an_unreachable_child_delivers_the_failure_notice_instead_of_no_reply() 
     assert!(extra.is_err(), "no second notice may arrive");
 }
 
+/// A give-up whose kill does not land delivers nothing: the child may still
+/// run, so it stays a live row (the watcher retries the stop later) instead
+/// of a failure that invites the parent to start a replacement beside it.
+#[tokio::test(start_paused = true)]
+async fn an_unreachable_child_whose_kill_fails_stays_live() {
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+        }
+    });
+    let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, mut kill_rx) =
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Failure, FakeChild::Unreachable)
+            .await;
+    let handle = spawn_child(&sessions).await;
+    sessions.notify_turn_done();
+
+    tokio::time::timeout(Duration::from_secs(3_600), kill_rx.recv())
+        .await
+        .expect("the give-up tries to stop the child")
+        .expect("kill channel open");
+    let notice = tokio::time::timeout(Duration::from_secs(60), follow_up_rx.recv()).await;
+    assert!(
+        notice.is_err(),
+        "no failure notice after a failed kill: {notice:?}"
+    );
+    let roster = sessions.list_subagents().await.unwrap();
+    let row = roster
+        .iter()
+        .find(|row| row.rlm_child_id == handle.rlm_child_id)
+        .unwrap();
+    assert_eq!(row.status, "running");
+}
+
 /// Hand-off into the unreachable give-up's poll: the fake parks the
 /// give-up poll, the test lands the reader's verdict, the fake releases
 /// the poll. Only the lost-claim test uses these.
@@ -2791,12 +2826,24 @@ async fn a_restarted_parent_resumes_its_recently_interrupted_children() {
     let mut ledger_lines = vec![r#"{"v":1,"op":"meta","at":"2026-10-25T00:00:00Z"}"#.to_string()];
     for (child_id, status) in [
         ("sub-run", "running"),
+        ("sub-finished", "running"),
         ("sub-stale", "running"),
         ("sub-done", "completed"),
     ] {
         let child = session_file(agent.join(format!(
             "session-artifacts/P/{child_id}/sess-{child_id}.jsonl"
         )));
+        if child_id == "sub-finished" {
+            // The update restart continued this child and it finished before
+            // the parent came back: its transcript ends in a completed turn.
+            let mut file = std::fs::File::options().append(true).open(&child).unwrap();
+            std::io::Write::write_all(
+                &mut file,
+                br#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-10-25T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}}
+"#,
+            )
+            .unwrap();
+        }
         crate::rlm_ledger::write_rlm_subagent_display(
             &crate::rlm_ledger::RlmSubagentDisplayEntry {
                 type_tag: "rlm_subagent".to_string(),
@@ -2851,15 +2898,25 @@ async fn a_restarted_parent_resumes_its_recently_interrupted_children() {
         }
     };
     let custom = &notice["customMessage"];
+    let finished_dir = agent.join("session-artifacts/P/sub-finished");
     assert_eq!(
         custom["details"]["children"],
-        json!([{
-            "childId": "sub-run",
-            "sessionName": "sub-run",
-            "sessionDir": run_dir.display().to_string(),
-            "outcome": "resumed",
-            "error": null,
-        }])
+        json!([
+            {
+                "childId": "sub-run",
+                "sessionName": "sub-run",
+                "sessionDir": run_dir.display().to_string(),
+                "outcome": "resumed",
+                "error": null,
+            },
+            {
+                "childId": "sub-finished",
+                "sessionName": "sub-finished",
+                "sessionDir": finished_dir.display().to_string(),
+                "outcome": "finished",
+                "error": null,
+            },
+        ])
     );
     assert!(
         custom["content"]
