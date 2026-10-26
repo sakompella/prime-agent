@@ -17,6 +17,9 @@ pub(super) enum WakeRoute {
 
 pub(crate) const ROUTE_TIMEOUT_MS: u64 = 30_000;
 pub(crate) const SUMMARY_TIMEOUT_MS: u64 = 5_000;
+/// How long a plain kill waits for the worker to take it before the stop
+/// skips the worker and escalates to signals.
+pub(crate) const PLAIN_KILL_ROUTE_TIMEOUT_MS: u64 = 15_000;
 /// The route failure for a worker whose command channel is gone: the request did not
 /// leave the supervisor, so the route may retry it without risking a duplicate landing.
 pub(crate) const WORKER_NOT_CONNECTED: &str = "Session worker is not connected";
@@ -41,6 +44,14 @@ pub(crate) const WORKER_REQUEST_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 /// The route budget of a client command: turn-long waits ride TS's 24 h
 /// worker-request budget; everything else is a short control route.
 pub(crate) fn client_route_timeout(command: &DaemonCommand) -> u64 {
+    // A bounded idle wait is answered by the worker at its own deadline.
+    if let DaemonCommand::WaitForIdle {
+        timeout_ms: Some(timeout_ms),
+        ..
+    } = command
+    {
+        return timeout_ms.saturating_add(ROUTE_TIMEOUT_MS);
+    }
     if matches!(
         command,
         DaemonCommand::PromptAndWait { .. }
@@ -556,7 +567,7 @@ impl Supervisor {
                     (descriptor.pid, descriptor.process_start_id.clone())
                 };
                 if super::worker_lifecycle::worker_process_gone(pid, start_id).await {
-                    self.finish_plain_kill_stop(&resident, rest).await;
+                    self.finish_plain_kill_stop(&resident, rest, false).await;
                     return (
                         vec![response_line(&response_success(
                             Some(&command_id),
@@ -594,7 +605,14 @@ impl Supervisor {
                 );
             }
         }
-        let timeout = client_route_timeout(command);
+        // A plain kill escalates to signals when the worker does not take it in
+        // time, so its budget stays well inside the asking client's own
+        // timeout (an RLM parent waits `KILL_TIMEOUT_MS`).
+        let timeout = if plain_kill {
+            PLAIN_KILL_ROUTE_TIMEOUT_MS
+        } else {
+            client_route_timeout(command)
+        };
         let (worker_command, mut payload) = match client_command_payload(command, client_id) {
             Ok(payload) => payload,
             Err(error) => {
@@ -835,7 +853,7 @@ impl Supervisor {
                     // TS's root-kill `finally`: the stop completes on a rejected or timed-out
                     // forward too; the marker-carrying child closes keep the success gate.
                     if plain_kill {
-                        self.finish_plain_kill_stop(&resident, rest).await;
+                        self.finish_plain_kill_stop(&resident, rest, true).await;
                     } else if response.success {
                         // A cascade-stop failure is observable (logged) instead of silently
                         // skipping the retire/registry/passivation tail.
@@ -888,7 +906,24 @@ impl Supervisor {
                 // lease cannot outlive the command; child closes keep the plain forward.
                 if plain_kill {
                     if let DaemonCommand::Kill { rest, .. } = command {
-                        self.finish_plain_kill_stop(&resident, rest).await;
+                        self.finish_plain_kill_stop(&resident, rest, false).await;
+                        // The worker never took the kill, but the stop's signals ended it:
+                        // the kill landed, so a delete must not read as failed and keep
+                        // its parent tracking a dead child.
+                        let (pid, start_id) = {
+                            let descriptor = resident.descriptor.lock().await;
+                            (descriptor.pid, descriptor.process_start_id.clone())
+                        };
+                        if super::worker_lifecycle::worker_process_gone(pid, start_id).await {
+                            return (
+                                vec![response_line(&response_success(
+                                    Some(&command_id),
+                                    &type_name,
+                                    None,
+                                ))],
+                                false,
+                            );
+                        }
                     }
                 }
                 (

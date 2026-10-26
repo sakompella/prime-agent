@@ -1082,3 +1082,5 @@ mod tests;
 mod turn_stream_tests;
 #[cfg(test)]
 mod update_snapshot_tests;
+#[cfg(test)]
+mod wait_for_idle_tests;

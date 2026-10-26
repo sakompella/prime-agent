@@ -602,12 +602,23 @@ impl Supervisor {
     /// The plain kill's stop aftermath, run on every route outcome: TS's root-kill block wraps
     /// the forward in a `finally`, so a hung worker still completes the stop. The stop's only
     /// `Err` is the tombstone persist, so the worker stays untouched and the kill retryable.
+    /// `worker_answered` is false when the kill route failed (the worker did
+    /// not take the kill inside its budget): the stop then skips the routed
+    /// shutdown, which would wait out the same unresponsive worker again,
+    /// and goes straight to the signal escalation.
     pub(super) async fn finish_plain_kill_stop(
         self: &Arc<Self>,
         resident: &Arc<ResidentWorker>,
         rest: &Map<String, Value>,
+        worker_answered: bool,
     ) {
-        if let Err(error) = self.stop_worker(resident).await {
+        let stopped = if worker_answered {
+            self.stop_worker(resident).await
+        } else {
+            self.stop_worker_releasing(resident, None, StopRoute::Skip)
+                .await
+        };
+        if let Err(error) = stopped {
             self.log_line(&format!(
                 "session worker {} stop after kill failed: {error:#}; the stop never durably started and stays retryable",
                 resident.worker_id
@@ -703,7 +714,10 @@ impl Supervisor {
         ) else {
             return response_success(Some(command_id), type_name, None);
         };
-        match self.stop_worker_releasing(&resident, Some(fence)).await {
+        match self
+            .stop_worker_releasing(&resident, Some(fence), StopRoute::Shutdown)
+            .await
+        {
             Ok(()) => {
                 self.log_line(&format!(
                     "session worker {} passivated idle (idleEvictionMinutes={threshold})",
@@ -724,7 +738,8 @@ impl Supervisor {
         self: &Arc<Self>,
         resident: &Arc<ResidentWorker>,
     ) -> anyhow::Result<()> {
-        self.stop_worker_releasing(resident, None).await
+        self.stop_worker_releasing(resident, None, StopRoute::Shutdown)
+            .await
     }
 
     /// The graceful stop; `fence` (the idle passivation's) is released
@@ -733,6 +748,7 @@ impl Supervisor {
         self: &Arc<Self>,
         resident: &Arc<ResidentWorker>,
         fence: Option<tokio::sync::OwnedSemaphorePermit>,
+        route: StopRoute,
     ) -> anyhow::Result<()> {
         // The stop's durable intent persists BEFORE the worker is told (TS
         // `persistWorkerStopTombstone`): a supervisor that dies mid-stop, or a worker that
@@ -748,24 +764,28 @@ impl Supervisor {
         // of its own. A client route that acquires a freed permit next
         // sees the retire (the post-admission check in routing.rs).
         drop(fence);
-        match self
-            .route_command_typed(
-                resident,
-                "shutdown",
-                json!({}),
-                ROUTE_TIMEOUT_MS,
-                RouteAdmission::SupervisorInternal,
-            )
-            .await
-        {
-            Ok(response) if response.success => {}
-            Ok(response) => {
+        let shutdown = match route {
+            StopRoute::Shutdown => Some(
+                self.route_command_typed(
+                    resident,
+                    "shutdown",
+                    json!({}),
+                    ROUTE_TIMEOUT_MS,
+                    RouteAdmission::SupervisorInternal,
+                )
+                .await,
+            ),
+            StopRoute::Skip => None,
+        };
+        match shutdown {
+            None | Some(Ok(DaemonResponse { success: true, .. })) => {}
+            Some(Ok(response)) => {
                 self.log_line(&format!(
                     "session worker {} shutdown route refused: {:?}",
                     resident.worker_id, response.error
                 ));
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 self.log_line(&format!(
                     "session worker {} shutdown route failed: {error:#}",
                     resident.worker_id
@@ -907,6 +927,14 @@ impl Supervisor {
         })
         .await;
     }
+}
+
+/// Whether a stop first asks the worker to shut down over its route, or (a
+/// worker that already failed to answer a kill) goes straight to signals.
+#[derive(Clone, Copy)]
+enum StopRoute {
+    Shutdown,
+    Skip,
 }
 
 /// A dead process or a verified replacement identity proves the old writer

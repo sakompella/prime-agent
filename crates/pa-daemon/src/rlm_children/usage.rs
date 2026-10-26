@@ -228,6 +228,34 @@ impl SupervisorChildSessionsInner {
         persisted
     }
 
+    /// Prime a reseeded row's lazy cursor at its file's tail, so the
+    /// pre-restart history is never billed.
+    pub(super) async fn prime_usage_cursor(record: &Arc<Mutex<ChildRecord>>) {
+        if record.lock().await.attributed_rows.is_some() {
+            return;
+        }
+        // A local, not an if-let scrutinee: the scrutinee's guard would
+        // live through the body and deadlock the re-lock below.
+        let session_file = record
+            .lock()
+            .await
+            .session_file
+            .clone()
+            .filter(|path| !path.is_empty());
+        let Some(session_file) = session_file else {
+            return;
+        };
+        let path = PathBuf::from(session_file);
+        let tail = tokio::task::spawn_blocking(move || {
+            crate::session_store::SessionFile::open(&path).map(|store| store.entries().len())
+        })
+        .await;
+        // A failed read stays lazy: a zero cursor would re-bill the whole history.
+        if let Ok(Ok(tail)) = tail {
+            record.lock().await.attributed_rows.get_or_insert(tail);
+        }
+    }
+
     /// Start the follow-up usage watcher for a settled child that is
     /// busy again (a delayed agent-message turn): observation-only, it
     /// never touches the run status, notices, or the settle hook.
@@ -235,29 +263,7 @@ impl SupervisorChildSessionsInner {
         if record.lock().await.closed_by_parent {
             return;
         }
-        // Prime a lazy cursor at the tail so the pre-restart history is never billed.
-        if record.lock().await.attributed_rows.is_none() {
-            // A local, not an if-let scrutinee: the scrutinee's guard would
-            // live through the body and deadlock the re-lock below.
-            let session_file = record
-                .lock()
-                .await
-                .session_file
-                .clone()
-                .filter(|path| !path.is_empty());
-            if let Some(session_file) = session_file {
-                let path = PathBuf::from(session_file);
-                let tail = tokio::task::spawn_blocking(move || {
-                    crate::session_store::SessionFile::open(&path)
-                        .map(|store| store.entries().len())
-                })
-                .await;
-                // A failed read stays lazy: a zero cursor would re-bill the whole history.
-                if let Ok(Ok(tail)) = tail {
-                    record.lock().await.attributed_rows.get_or_insert(tail);
-                }
-            }
-        }
+        Self::prime_usage_cursor(record).await;
         {
             let mut record = record.lock().await;
             if record.usage_watch_live {
