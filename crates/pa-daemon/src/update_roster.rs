@@ -181,7 +181,7 @@ fn subagent_rows(
             .join(&edge.child_id);
         let display = read_rlm_subagent_display(&child_dir);
         let status = match display.as_ref().map(|entry| entry.status.as_str()) {
-            Some("completed") => UpdateRosterSubagentStatus::Completed,
+            Some("completed" | "error" | "cancelled") => UpdateRosterSubagentStatus::Completed,
             Some("running") => UpdateRosterSubagentStatus::Running,
             _ => {
                 if resident_files.contains(&canonical_session_path(Path::new(&edge.child))) {

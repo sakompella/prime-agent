@@ -297,6 +297,13 @@ impl SupervisorChildSessionsInner {
                 if was_running && matches!(reason, ChildCloseReason::Killed) {
                     self.record_child_cancelled(record, ChildCancelledReason::CloseKilled)
                         .await;
+                    // A killed parent's run is over for good: a later reopen
+                    // of the parent must not resume it.
+                    let (session_dir, child_id) = {
+                        let record = record.lock().await;
+                        (record.session_dir.clone(), record.rlm_child_id.clone())
+                    };
+                    super::lifecycle::settle_display(session_dir, child_id, "cancelled").await;
                 }
                 self.retain_retired_usage(record, super::RetirementIntent::Close);
                 self.emit_child_usage(record).await;
@@ -487,8 +494,9 @@ impl SupervisorChildSessionsInner {
     /// non-deleted ledger children again, addressed by their durable
     /// session ids. Every reseeded row is settled (nothing is owed), and
     /// its usage cursor starts lazy: the first delivery primes it at the
-    /// file's tail.
-    pub(super) async fn reseed_from_ledger(&self) {
+    /// file's tail. Returns the rows whose run was interrupted recently
+    /// (see [`super::resume`]).
+    pub(super) async fn reseed_from_ledger(&self) -> Vec<Arc<Mutex<ChildRecord>>> {
         let Some(parent_file) = self
             .identity
             .lock()
@@ -496,7 +504,7 @@ impl SupervisorChildSessionsInner {
             .session_file
             .clone()
         else {
-            return;
+            return Vec::new();
         };
         let agent_dir = self.agent_dir.clone();
         let supervisor_socket = self.link.socket_path().clone();
@@ -516,13 +524,17 @@ impl SupervisorChildSessionsInner {
             .as_deref()
             != Some(parent_file.as_str())
         {
-            return;
+            return Vec::new();
         }
-        children.extend(
-            records
-                .into_iter()
-                .map(|record| Arc::new(Mutex::new(record))),
-        );
+        let mut interrupted = Vec::new();
+        for (record, recently_interrupted) in records {
+            let record = Arc::new(Mutex::new(record));
+            if recently_interrupted {
+                interrupted.push(Arc::clone(&record));
+            }
+            children.push(record);
+        }
+        interrupted
     }
 }
 
@@ -530,12 +542,13 @@ impl SupervisorChildSessionsInner {
 /// (TS `listPassiveRlmSubagents`), read from the ledger the supervisor
 /// writes (its persisted default sessions dir): the child file's stem
 /// addresses each row both ways - resolve for a resident child, wake
-/// for a passive one; an unreadable ledger reads as empty.
+/// for a passive one; an unreadable ledger reads as empty. Each row says
+/// whether its run was interrupted inside [`super::resume::RESUME_WINDOW`].
 fn ledger_child_records(
     agent_dir: &Path,
     supervisor_socket: &Path,
     parent_file: &Path,
-) -> Vec<ChildRecord> {
+) -> Vec<(ChildRecord, bool)> {
     let Some(sessions_dir) = crate::descriptor::load_supervisor_config(
         &crate::descriptor::descriptor_dir(agent_dir, supervisor_socket)
             .join(crate::descriptor::SUPERVISOR_CONFIG_FILE_NAME),
@@ -562,7 +575,16 @@ fn ledger_child_records(
             .parent()
             .and_then(crate::rlm_ledger::read_rlm_subagent_display)
             .filter(|display| display.child_id == edge.child_id);
-        records.push(ChildRecord {
+        // A display still `running` names a run that never got a verdict
+        // (`record_settled_display`): the daemon or the parent stopped under it.
+        let interrupted = display
+            .as_ref()
+            .is_some_and(|display| display.status == "running");
+        let recently_interrupted = interrupted
+            && std::fs::metadata(&child)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(super::resume::within_resume_window);
+        let record = ChildRecord {
             rlm_child_id: edge.child_id,
             session_name: edge.name,
             active_session_id: session_id.clone().unwrap_or_default(),
@@ -599,13 +621,10 @@ fn ledger_child_records(
                 |display| display.created_at,
             ),
             settled_status: Some(
-                if display
-                    .as_ref()
-                    .is_some_and(|display| display.status == "running")
-                {
-                    "error"
-                } else {
-                    "done"
+                match display.as_ref().map(|display| display.status.as_str()) {
+                    None | Some("completed") => "done",
+                    Some("cancelled") => "cancelled",
+                    Some(_) => "error",
                 },
             ),
             settled: true,
@@ -634,7 +653,8 @@ fn ledger_child_records(
             emit_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             last_emitted_status: None,
             rename_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        });
+        };
+        records.push((record, recently_interrupted));
     }
     records
 }

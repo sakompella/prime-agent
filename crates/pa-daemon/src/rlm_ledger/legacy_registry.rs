@@ -77,7 +77,10 @@ pub fn read_rlm_subagent_display(child_session_dir: &Path) -> Option<RlmSubagent
     let content = fs::read_to_string(child_session_dir.join("rlm-subagent.json")).ok()?;
     let entry: RlmSubagentDisplayEntry = serde_json::from_str(&content).ok()?;
     if entry.type_tag != "rlm_subagent"
-        || !matches!(entry.status.as_str(), "running" | "completed" | "deleted")
+        || !matches!(
+            entry.status.as_str(),
+            "running" | "completed" | "error" | "cancelled" | "deleted"
+        )
     {
         return None;
     }

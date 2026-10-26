@@ -68,7 +68,9 @@ const WATCH_SETTLE_GRACE_MS: u64 = 250;
 const CREATE_TIMEOUT_MS: u64 = 120_000;
 const PROMPT_TIMEOUT_MS: u64 = 30_000;
 const STATE_TIMEOUT_MS: u64 = 30_000;
-const KILL_TIMEOUT_MS: u64 = 30_000;
+/// Covers the supervisor's worst plain kill: the worker's 15s kill route,
+/// then SIGTERM, its grace and the SIGKILL verify.
+const KILL_TIMEOUT_MS: u64 = 45_000;
 /// Budget for one session rename over the supervisor route (TS uses 30s).
 const RENAME_TIMEOUT_MS: u64 = 30_000;
 /// Grace over a collect budget passed to the worker `wait_for_idle`.
@@ -146,6 +148,9 @@ struct ChildObservation {
     sequence: Option<u64>,
     source: ChildObservationSource,
 }
+
+/// Reseeded children whose run a restart interrupted (see `resume`).
+pub struct InterruptedChildren(Vec<Arc<Mutex<ChildRecord>>>);
 
 /// One tracked child session.
 #[derive(Debug)]
@@ -617,9 +622,22 @@ impl SupervisorChildSessions {
     }
 
     /// Rebuild the children registry from the spawn ledger (a restarted
-    /// parent lists its ledger children again).
-    pub async fn reseed_from_ledger(&self) {
-        self.inner.reseed_from_ledger().await;
+    /// parent lists its ledger children again). Returns the children whose
+    /// run a restart interrupted, for [`Self::resume_interrupted`].
+    pub async fn reseed_from_ledger(&self) -> InterruptedChildren {
+        InterruptedChildren(self.inner.reseed_from_ledger().await)
+    }
+
+    /// Resume the interrupted children in the background and tell the
+    /// parent session once what was resumed and what was not.
+    pub fn resume_interrupted(&self, children: InterruptedChildren) {
+        if children.0.is_empty() {
+            return;
+        }
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            SupervisorChildSessionsInner::resume_interrupted_children(&inner, children.0).await;
+        });
     }
 
     /// The inherited RLM depth bound (TS `getRlmMaxDepthStatus().maxDepth`
@@ -1122,6 +1140,7 @@ impl SupervisorChildSessionsInner {
 mod host;
 mod lifecycle;
 mod registry;
+mod resume;
 mod usage;
 
 #[cfg(test)]
