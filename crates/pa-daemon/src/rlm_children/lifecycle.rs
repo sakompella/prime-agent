@@ -645,14 +645,22 @@ impl SupervisorChildSessionsInner {
                     // `Killed` is the plain kill: when the worker does not
                     // take it in time the supervisor escalates to signals,
                     // and the worker's kernel exits with the worker.
+                    // A kill that did not land leaves the child possibly
+                    // live: keep watching it and retry after another streak.
                     if record.lock().await.settled_status.is_none() {
                         if let Err(error) = self
                             .kill_child(&active_session_id, ChildCloseReason::Killed)
                             .await
                         {
-                            eprintln!(
-                                "pa-daemon: stopping unreachable RLM child session {active_session_id} failed: {error:#}"
-                            );
+                            if super::registry::unknown_session(&error).is_none() {
+                                eprintln!(
+                                    "pa-daemon: stopping unreachable RLM child session {active_session_id} failed: {error:#}"
+                                );
+                                unreachable_polls = 0;
+                                tokio::time::sleep(Duration::from_millis(WATCH_POLL_INTERVAL_MS))
+                                    .await;
+                                continue;
+                            }
                         }
                     }
                     // A dead child keeps whatever rows its file already

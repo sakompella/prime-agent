@@ -570,8 +570,10 @@ fn a_daemon_restart_relists_and_wakes_the_parents_child() {
     restart_relists_child(0, "completed");
 }
 
+/// A child still mid-run when the daemon stopped is resumed by its
+/// reattached parent, which hears about it once.
 #[test]
-fn a_daemon_restart_marks_a_still_running_child_as_failed() {
+fn a_daemon_restart_resumes_a_still_running_child() {
     restart_relists_child(30_000, "running");
 }
 
@@ -724,19 +726,31 @@ fn restart_relists_child(delay_ms: u64, display_status: &str) {
     // (a) relisted
     let rows: Value =
         serde_json::from_str(&await_receipt(&list_receipt)).expect("list receipt json");
-    assert_eq!(
-        rows,
-        json!([[
-            child_id,
-            if display_status == "completed" {
-                "completed"
-            } else {
-                "error"
-            },
-            child_session_id
-        ]]),
-        "the restarted parent must relist its ledger child with its persisted status"
-    );
+    if display_status == "completed" {
+        assert_eq!(
+            rows,
+            json!([[child_id, "completed", child_session_id]]),
+            "the restarted parent must relist its ledger child with its persisted status"
+        );
+    } else {
+        // The resumed run is live again or already finished, never `error`.
+        assert!(
+            rows == json!([[child_id, "running", child_session_id]])
+                || rows == json!([[child_id, "completed", child_session_id]]),
+            "the restarted parent must resume its interrupted child: {rows}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !std::fs::read_to_string(&parent_file)
+            .unwrap_or_default()
+            .contains("rlm_children_resumed")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the parent never got the resume notice"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
     // (b) send receipt
     let _send: Value =
         serde_json::from_str(&await_receipt(&send_receipt)).expect("send receipt json");

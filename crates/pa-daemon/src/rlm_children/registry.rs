@@ -13,7 +13,7 @@ use pa_core::session_engine::semantic_edges::ChildCancelledReason;
 
 /// The already-gone marker inside a close failure: a close walking a
 /// child that died earlier must not fail (a missing child session is a completed no-op).
-fn unknown_session(error: &anyhow::Error) -> Option<()> {
+pub(super) fn unknown_session(error: &anyhow::Error) -> Option<()> {
     error.chain().find_map(|cause| {
         cause
             .to_string()
@@ -115,6 +115,13 @@ impl SupervisorChildSessionsInner {
             if cancelled_confirmed {
                 self.record_child_cancelled(record, ChildCancelledReason::UserCancel)
                     .await;
+                // The verdict is durable now: a parent shutdown before the
+                // watcher's settle tail must not leave the run resumable.
+                let (session_dir, child_id) = {
+                    let record = record.lock().await;
+                    (record.session_dir.clone(), record.rlm_child_id.clone())
+                };
+                super::lifecycle::settle_display(session_dir, child_id, "cancelled").await;
             } else {
                 // The abort was refused for a real reason: the child never
                 // got the command, so undo the whole pre-abort claim — the
