@@ -281,3 +281,79 @@ async fn a_retried_delete_after_the_tombstone_is_gated_on_the_worker_process() {
     assert!(error.contains(&format!("(pid {live_pid})")), "{error}");
     assert_eq!(std::fs::read(ledger.ledger_path()).unwrap(), ledger_before);
 }
+
+/// A live worker that never answers (its in-flight slots held, or its
+/// loop wedged) still dies to a delete: the kill route gives up inside its
+/// own budget, the stop skips the routed shutdown that would wait out the
+/// same worker again, and signals end the process, all inside the RLM
+/// parent's kill timeout, so the delete answers success.
+#[tokio::test]
+async fn a_delete_of_an_unresponsive_live_worker_kills_it_inside_the_parents_timeout() {
+    let Fixture {
+        _dir,
+        supervisor,
+        child_file,
+        ledger,
+    } = fixture().await;
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = sleeper.id();
+    let (descriptor, descriptor_path) = child_descriptor(
+        &supervisor,
+        &child_file,
+        pid,
+        crate::lease::get_process_start_id(pid).as_deref(),
+    );
+    let resident = ResidentWorker::new("w-child".to_string(), descriptor, descriptor_path);
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<WorkerRequest>(4);
+    *resident.cmd_tx.lock().await = Some(cmd_tx);
+    // Records what reaches the worker and answers nothing.
+    let pump = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        while let Some(request) = cmd_rx.recv().await {
+            seen.push(request.command_type.clone());
+        }
+        seen
+    });
+    resident.note_connection_live();
+    resident.note_session_ready();
+    supervisor.registry.insert(Arc::clone(&resident)).await;
+
+    let started = std::time::Instant::now();
+    let response = route_delete(&supervisor).await;
+    let elapsed = started.elapsed();
+
+    let exited = sleeper.try_wait().expect("probe the worker process");
+    if exited.is_none() {
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
+    assert!(
+        exited.is_some(),
+        "the unresponsive worker's process was killed"
+    );
+    assert_eq!(response["success"], json!(true), "{response}");
+    assert!(
+        ledger.live_edges().expect("edges").is_empty(),
+        "the delete tombstones the child"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "the delete answered after {elapsed:?}, past the parent's kill timeout"
+    );
+    *resident.cmd_tx.lock().await = None;
+    supervisor.registry.remove("w-child").await;
+    drop(resident);
+    let seen = tokio::time::timeout(std::time::Duration::from_secs(5), pump)
+        .await
+        .map(|joined| joined.expect("pump"));
+    if let Ok(seen) = seen {
+        assert_eq!(
+            seen,
+            ["kill"],
+            "no routed shutdown after an unanswered kill"
+        );
+    }
+}

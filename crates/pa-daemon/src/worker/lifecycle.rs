@@ -190,7 +190,8 @@ impl Worker {
             .as_ref()
             .and_then(|engine| engine.children.clone())
         {
-            children.reseed_from_ledger().await;
+            let interrupted = children.reseed_from_ledger().await;
+            children.resume_interrupted(interrupted);
         }
     }
 
@@ -593,9 +594,20 @@ impl Worker {
     /// `waitForRlmQuiescence` also holds until its RLM children settled
     /// (the parent-side settle watcher and `collect` wait out a child's
     /// whole subtree this way).
+    /// `timeoutMs` bounds the wait: the answer then says whether the
+    /// session went idle (`idle: false` when the budget ran out first).
     pub(crate) async fn handle_wait_for_idle(&self, payload: &Value) -> DaemonResponse {
-        self.wait_until_quiescent(payload).await;
-        response_success(None, "wait_for_idle", None)
+        let Some(timeout_ms) = payload.get("timeoutMs").and_then(Value::as_u64) else {
+            self.wait_until_quiescent(payload).await;
+            return response_success(None, "wait_for_idle", None);
+        };
+        let idle = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            self.wait_until_quiescent(payload),
+        )
+        .await
+        .is_ok();
+        response_success(None, "wait_for_idle", Some(json!({ "idle": idle })))
     }
 
     /// `wait_for_headless_completion` (TS daemon command): settle the
