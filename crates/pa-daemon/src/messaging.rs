@@ -390,11 +390,26 @@ impl Supervisor {
         };
         // The launch is DETACHED and bounded only by the caller's wait:
         // dropping the future at the budget skipped launch_worker's own
-        // cleanup and left a half-registered resident.
+        // cleanup and left a half-registered resident. It holds the client
+        // create's per-file single-flight, so a client open racing this wake
+        // waits and then reuses the woken worker instead of losing the lease.
         let launch = tokio::spawn({
             let supervisor = Arc::clone(self);
-            let create = create;
-            async move { supervisor.launch_worker(&create, None).await }
+            let session_file = session_file.to_string();
+            async move {
+                let _opening = supervisor.opening_guard(&create).await?;
+                match supervisor
+                    .registry
+                    .find_by_session_file(&session_file)
+                    .await
+                {
+                    Some(resident) => Ok(resident),
+                    None => supervisor
+                        .launch_worker(&create, None)
+                        .await
+                        .map(|(resident, _create_summary)| resident),
+                }
+            }
         });
         let launched = tokio::time::timeout(
             std::time::Duration::from_millis(crate::supervisor::ROUTE_TIMEOUT_MS),
@@ -402,7 +417,7 @@ impl Supervisor {
         )
         .await;
         match launched {
-            Ok(Ok(Ok((resident, _create_summary)))) => {
+            Ok(Ok(Ok(resident))) => {
                 self.refresh_roster_entry(&resident).await;
                 WakeOutcome::Woken(resident)
             }

@@ -34,6 +34,15 @@ use serde_json::{json, Value};
 /// How the continuation prompt a resumed child gets begins.
 const RESUME_PROMPT_START: &str = "Your run was interrupted";
 
+/// The parsed rows of a session file.
+fn session_rows(file: &Path) -> Vec<Value> {
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
 struct Daemon {
     child: Child,
     #[allow(dead_code)]
@@ -700,16 +709,27 @@ fn restart_relists_child(delay_ms: u64, display_status: &str) {
     if display_status == "running" {
         // Nothing reopens the parent: the boot wakes it, and its reseed
         // resumes the child and tells the parent.
-        let occurrences = |file: &Path, needle: &str| {
-            std::fs::read_to_string(file)
-                .unwrap_or_default()
-                .matches(needle)
+        let resume_notices = || {
+            session_rows(Path::new(&parent_file))
+                .iter()
+                .filter(|row| {
+                    row["type"] == "custom_message" && row["customType"] == "rlm_children_resumed"
+                })
+                .count()
+        };
+        let resume_prompts = || {
+            session_rows(&child_file)
+                .iter()
+                .filter(|row| {
+                    row["message"]["role"] == "user"
+                        && row["message"]["content"][0]["text"]
+                            .as_str()
+                            .is_some_and(|text| text.starts_with(RESUME_PROMPT_START))
+                })
                 .count()
         };
         let deadline = Instant::now() + Duration::from_mins(1);
-        while occurrences(&child_file, RESUME_PROMPT_START) == 0
-            || occurrences(Path::new(&parent_file), "rlm_children_resumed") == 0
-        {
+        while resume_prompts() == 0 || resume_notices() == 0 {
             assert!(
                 Instant::now() < deadline,
                 "the boot never resumed the child without its parent"
@@ -721,21 +741,37 @@ fn restart_relists_child(delay_ms: u64, display_status: &str) {
                 .into_iter()
                 .find(|summary| summary["sessionId"] == json!(parent_session_id))
         });
-        // The reopen reuses the woken parent, so no second reseed runs.
-        let reopened = create_parent(
-            &mut client,
-            dir.path(),
-            &parent_script,
-            &child_script,
-            Some(Path::new(&parent_file)),
+        // A client-owned reopen (T3 Code's) reuses the woken parent, so no
+        // second reseed runs.
+        let sessions_dir = dir.path().join("sessions");
+        client.send_command(
             "c2",
+            &json!({
+                "type": "create",
+                "lifecycle": "client_owned",
+                "sessionPath": parent_file,
+                "config": {
+                    "cwd": dir.path().to_string_lossy(),
+                    "sessionDir": sessions_dir.to_string_lossy(),
+                },
+            }),
         );
-        assert_eq!(reopened["activeSessionId"], woken["activeSessionId"]);
-        assert_eq!(occurrences(&child_file, RESUME_PROMPT_START), 1);
+        let reopened = client.read_response("c2");
+        assert_eq!(reopened["success"], true, "reopen failed: {reopened}");
         assert_eq!(
-            occurrences(Path::new(&parent_file), "rlm_children_resumed"),
-            1
+            reopened["data"]["activeSessionId"],
+            woken["activeSessionId"]
         );
+        // Once the resumed run settles, its resume has run its course.
+        let deadline = Instant::now() + Duration::from_mins(1);
+        while serde_json::from_slice::<Value>(&std::fs::read(&display_file).unwrap_or_default())
+            .is_ok_and(|display| display["status"] == "running")
+        {
+            assert!(Instant::now() < deadline, "the resumed child never settled");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(resume_prompts(), 1);
+        assert_eq!(resume_notices(), 1);
         return;
     }
 

@@ -2,7 +2,9 @@
 //! the durable truth rehydrates from recovery journals and session files.
 //!
 //! THE NO-AUTO-RESUME CONTRACT: a boot never creates a worker the user did
-//! not ask for; due heartbeats stay dormant (restore never fails the boot).
+//! not ask for, except the parents of RLM children a restart interrupted
+//! (`supervisor/interrupted_children.rs`); due heartbeats stay dormant
+//! (restore never fails the boot).
 
 use std::collections::BTreeMap;
 use std::path::Path;

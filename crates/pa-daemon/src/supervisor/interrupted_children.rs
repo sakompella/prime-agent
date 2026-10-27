@@ -3,15 +3,16 @@
 //! `rlm_children::resume`). A parent that was idle at the restart has no
 //! turn to continue and no client to reopen it, so the boot wakes it here,
 //! the way a message to a saved session wakes it. The parent's create
-//! resumes the children and sends its one notice; a later client open of
-//! the same file reuses that worker, so nothing resumes twice.
-use std::collections::{BTreeMap, HashSet};
+//! resumes the children and sends its one notice; a client open of the same
+//! file reuses that worker instead of creating (and reseeding) another.
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::messaging::WakeOutcome;
 use crate::rlm_ledger::RlmLedgerEdge;
+use crate::session_store::{read_session_info, SessionInfo};
 
 use super::Supervisor;
 
@@ -23,17 +24,26 @@ struct ParentWake {
     child_id: Option<String>,
 }
 
-/// The parents of the `interrupted` edges, once each. A parent that is
-/// itself an interrupted child is left out: its own parent's resume prompt
-/// wakes it, and a wake here first would leave that resume looking at a
-/// turn it never started. Sessions match by file stem (the session id), as
-/// the ledger wake matches them.
-fn parents_to_wake(
-    edges: &[RlmLedgerEdge],
-    interrupted: impl Fn(&RlmLedgerEdge) -> bool,
-) -> Vec<ParentWake> {
+/// The parents of the recently interrupted edges, once each, with their
+/// session headers. Left out:
+/// - a parent that is itself an interrupted child: its own parent's resume
+///   wakes it (the continuation prompt, or the settle watcher's idle wait
+///   for a child whose transcript already ends in a finished turn);
+/// - an archived parent: a deliberate stop (a parent kill whose child close
+///   never ran leaves its children `running`);
+/// - a parent whose header cannot be read.
+///
+/// Sessions match by file stem (the session id), as the ledger wake does.
+fn parents_to_wake(edges: &[RlmLedgerEdge]) -> Vec<(ParentWake, SessionInfo)> {
     let session_id = |file: &str| Path::new(file).file_stem().map(OsString::from);
-    let interrupted: Vec<&RlmLedgerEdge> = edges.iter().filter(|edge| interrupted(edge)).collect();
+    let child_ids: HashMap<OsString, &str> = edges
+        .iter()
+        .filter_map(|edge| Some((session_id(&edge.child)?, edge.child_id.as_str())))
+        .collect();
+    let interrupted: Vec<&RlmLedgerEdge> = edges
+        .iter()
+        .filter(|edge| crate::rlm_children::recently_interrupted(edge))
+        .collect();
     let resuming: HashSet<OsString> = interrupted
         .iter()
         .filter_map(|edge| session_id(&edge.child))
@@ -43,20 +53,22 @@ fn parents_to_wake(
         let Some(parent_id) = session_id(&edge.parent) else {
             continue;
         };
-        if resuming.contains(&parent_id) {
-            continue;
+        if !resuming.contains(&parent_id) {
+            parents
+                .entry(parent_id)
+                .or_insert_with_key(|parent_id| ParentWake {
+                    session_file: edge.parent.clone(),
+                    child_id: child_ids.get(parent_id).map(|id| (*id).to_string()),
+                });
         }
-        parents
-            .entry(parent_id)
-            .or_insert_with_key(|parent_id| ParentWake {
-                session_file: edge.parent.clone(),
-                child_id: edges
-                    .iter()
-                    .find(|own| session_id(&own.child).as_ref() == Some(parent_id))
-                    .map(|own| own.child_id.clone()),
-            });
     }
-    parents.into_values().collect()
+    parents
+        .into_values()
+        .filter_map(|parent| {
+            let info = read_session_info(Path::new(&parent.session_file))?;
+            (info.state.as_deref() != Some("archived")).then_some((parent, info))
+        })
+        .collect()
 }
 
 impl Supervisor {
@@ -74,17 +86,7 @@ impl Supervisor {
             }
         };
         let scan = tokio::task::spawn_blocking(move || {
-            ledger.live_edges().map(|edges| {
-                parents_to_wake(&edges, crate::rlm_children::recently_interrupted)
-                    .into_iter()
-                    .map(|parent| {
-                        let info = crate::session_store::read_session_info(Path::new(
-                            &parent.session_file,
-                        ));
-                        (parent, info)
-                    })
-                    .collect::<Vec<_>>()
-            })
+            ledger.live_edges().map(|edges| parents_to_wake(&edges))
         })
         .await;
         let parents = match scan {
@@ -103,14 +105,6 @@ impl Supervisor {
             }
         };
         for (parent, info) in parents {
-            // A parent file deleted or archived since names nothing to wake.
-            let Some(info) = info else {
-                self.log_line(&format!(
-                    "interrupted RLM children: parent {} is unreadable; not woken",
-                    parent.session_file
-                ));
-                continue;
-            };
             let outcome = self
                 .launch_session_wake(
                     &parent.session_file,
@@ -140,6 +134,18 @@ mod tests {
 
     use super::*;
 
+    fn session_file(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let id = path.file_stem().unwrap().to_string_lossy();
+        std::fs::write(
+            path,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-10-25T00:00:00.000Z\",\"cwd\":\"/tmp\"}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
     /// One ledger edge whose child file and display exist under `root`.
     fn edge(
         root: &Path,
@@ -149,8 +155,7 @@ mod tests {
         age: Duration,
     ) -> RlmLedgerEdge {
         let child = root.join(child_id).join(format!("{child_id}.jsonl"));
-        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
-        std::fs::write(&child, "{}\n").unwrap();
+        session_file(&child);
         crate::rlm_ledger::write_rlm_subagent_display(
             &crate::rlm_ledger::RlmSubagentDisplayEntry {
                 type_tag: "rlm_subagent".to_string(),
@@ -188,25 +193,29 @@ mod tests {
         PathBuf::from(&edge.child)
     }
 
-    /// The boot wakes the top of each interrupted family once: a parent of
-    /// a recently interrupted child, never one whose children are all old
-    /// or settled, and never an interrupted child (its own parent's resume
-    /// wakes it). A settled child with interrupted children of its own is
-    /// woken with its child identity.
+    /// The boot selects the top of each interrupted family once: a parent
+    /// of a recently interrupted child, never one whose children are all
+    /// old or settled, never an interrupted child (its own parent's resume
+    /// wakes it), and never an archived parent. A settled child with
+    /// interrupted children of its own is selected with its child identity.
     #[test]
-    fn the_boot_wakes_each_parent_of_a_recently_interrupted_child_once() {
+    fn the_boot_selects_each_live_parent_of_a_recently_interrupted_child_once() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let recent = Duration::from_secs(60);
         let old = Duration::from_hours(7);
-        let parent = root.join("P.jsonl");
-        let idle = root.join("Q.jsonl");
+        let [parent, idle, archived] = ["P", "Q", "A"].map(|id| root.join(format!("{id}.jsonl")));
+        for file in [&parent, &idle, &archived] {
+            session_file(file);
+        }
+        crate::stop_cleanup::ensure_archived_state(&archived).unwrap();
         let mut edges = vec![
             edge(root, &parent, "sub-run-1", "running", recent),
             edge(root, &parent, "sub-run-2", "running", recent),
             edge(root, &idle, "sub-stale", "running", old),
             edge(root, &idle, "sub-done", "completed", recent),
             edge(root, &idle, "sub-cancelled", "cancelled", recent),
+            edge(root, &archived, "sub-killed", "running", recent),
         ];
         // P -> sub-mid (interrupted) -> sub-leaf (interrupted): only P wakes.
         let mid = edge(root, &parent, "sub-mid", "running", recent);
@@ -216,15 +225,19 @@ mod tests {
         let grandkid = edge(root, &file_of(&waiting), "sub-grandkid", "running", recent);
         edges.extend([mid, leaf, waiting.clone(), grandkid]);
 
+        let selected: Vec<ParentWake> = parents_to_wake(&edges)
+            .into_iter()
+            .map(|(parent, _)| parent)
+            .collect();
         assert_eq!(
-            parents_to_wake(&edges, crate::rlm_children::recently_interrupted),
+            selected,
             vec![
                 ParentWake {
                     session_file: parent.display().to_string(),
                     child_id: None,
                 },
                 ParentWake {
-                    session_file: waiting.child.clone(),
+                    session_file: waiting.child,
                     child_id: Some("sub-waiting".to_string()),
                 },
             ]
