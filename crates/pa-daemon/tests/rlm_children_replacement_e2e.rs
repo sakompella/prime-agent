@@ -764,8 +764,8 @@ fn restart_relists_child(delay_ms: u64, display_status: &str) {
         );
         // Once the resumed run settles, its resume has run its course.
         let deadline = Instant::now() + Duration::from_mins(1);
-        while serde_json::from_slice::<Value>(&std::fs::read(&display_file).unwrap_or_default())
-            .is_ok_and(|display| display["status"] == "running")
+        while !serde_json::from_slice::<Value>(&std::fs::read(&display_file).unwrap_or_default())
+            .is_ok_and(|display| display["status"].is_string() && display["status"] != "running")
         {
             assert!(Instant::now() < deadline, "the resumed child never settled");
             std::thread::sleep(Duration::from_millis(100));
