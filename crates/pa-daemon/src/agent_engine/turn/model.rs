@@ -1,5 +1,7 @@
 //! The model-turn runner: the streaming run over the built session agent,
 //! the retry/failover policy application, and the quota-park mid-run arm.
+use pa_core::session_engine::provider_failover::CandidateSwitch;
+
 use super::{
     aborted_message, drop_trailing_assistant, json_round_trip, map_thinking_level,
     retry_event_to_engine_event, AgentSessionEngine, EngineEvent, ProviderTarget, StopReason,
@@ -501,25 +503,8 @@ impl AgentSessionEngine {
                     let agent = agent.clone();
                     let persistence = persistence.clone();
                     let core = core.clone();
-                    {
-                        let mut primary = primary_state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        // Capture the primary state once (TS `_backupModel`), restored when the
-                        // successful backup response arrives.
-                        if primary.is_none() {
-                            let (api_key, headers) = self.resolve_request_key_and_headers(&model);
-                            *primary = Some(FailoverPrimary {
-                                model: model.clone(),
-                                thinking_level: map_thinking_level(self.effective_thinking()),
-                                api_key,
-                                headers,
-                                session_restored: false,
-                            });
-                        } else if let Some(primary) = primary.as_mut() {
-                            primary.session_restored = false;
-                        }
-                    }
+                    let primary_state = primary_state.clone();
+                    let model = &model;
                     let next = next.clone();
                     async move {
                         let agent_model = json_round_trip(&next)
@@ -549,12 +534,18 @@ impl AgentSessionEngine {
                             // target across the failover switch — through
                             // the fenced install (the route lock covers
                             // the clone and the slot write together).
-                            if !self.install_armed_route_target() {
+                            let next_target = if self.install_armed_route_target() {
+                                None
+                            } else {
                                 let (api_key, headers) =
                                     self.resolve_request_key_and_headers(&next);
-                                let mut target =
-                                    self.provider_target.write().expect("provider target lock");
-                                *target = Some(ProviderTarget {
+                                // The candidate list never refreshes logins, so an expired
+                                // login whose refresh fails is listed; switching to it would
+                                // only replace the primary's error with "No API key".
+                                if api_key.is_none() {
+                                    return Ok(CandidateSwitch::NoCredential);
+                                }
+                                Some(ProviderTarget {
                                     service_tier: *self
                                         .service_tier
                                         .read()
@@ -562,7 +553,33 @@ impl AgentSessionEngine {
                                     api_key,
                                     model: next.clone(),
                                     headers,
-                                });
+                                })
+                            };
+                            {
+                                let mut primary = primary_state
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                // Capture the primary state once (TS `_backupModel`), restored
+                                // when the successful backup response arrives.
+                                if primary.is_none() {
+                                    let (api_key, headers) =
+                                        self.resolve_request_key_and_headers(model);
+                                    *primary = Some(FailoverPrimary {
+                                        model: model.clone(),
+                                        thinking_level: map_thinking_level(
+                                            self.effective_thinking(),
+                                        ),
+                                        api_key,
+                                        headers,
+                                        session_restored: false,
+                                    });
+                                } else if let Some(primary) = primary.as_mut() {
+                                    primary.session_restored = false;
+                                }
+                            }
+                            if let Some(target) = next_target {
+                                *self.provider_target.write().expect("provider target lock") =
+                                    Some(target);
                             }
                         }
                         agent.set_model(agent_model).await;
@@ -582,7 +599,7 @@ impl AgentSessionEngine {
                         )) {
                             anyhow::bail!("Model switch persistence was cancelled");
                         }
-                        Ok(())
+                        Ok(CandidateSwitch::Switched)
                     }
                 },
                 &restore_primary,
