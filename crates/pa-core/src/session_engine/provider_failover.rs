@@ -678,6 +678,22 @@ mod tests {
         assert_eq!(harness.attempts, 4);
         assert_eq!(harness.switches, vec!["backup-b/glm-5.3"]);
 
+        let after_a_switch = (0..6).map(|_| failures()).collect();
+        let harness = drive_declining(
+            &fast_failover(),
+            &[model("backup-a"), model("dead")],
+            after_a_switch,
+            &["dead"],
+        )
+        .await;
+        assert_eq!(harness.attempts, 6);
+        assert_eq!(harness.switches, vec!["backup-a/glm-5.3"]);
+        assert_eq!(
+            harness.restores.len(),
+            1,
+            "the earlier switch restores once"
+        );
+
         let exhausted = vec![failures(), failures(), failures()];
         let harness =
             drive_declining(&fast_failover(), &[model("dead")], exhausted, &["dead"]).await;

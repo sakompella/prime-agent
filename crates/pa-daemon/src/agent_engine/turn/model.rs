@@ -541,8 +541,13 @@ impl AgentSessionEngine {
                                     self.resolve_request_key_and_headers(&next);
                                 // The candidate list never refreshes logins, so an expired
                                 // login whose refresh fails is listed; switching to it would
-                                // only replace the primary's error with "No API key".
-                                if api_key.is_none() {
+                                // only replace the primary's error with "No API key". Only a
+                                // stored login is judged: header-only and ambient (ADC)
+                                // transports authenticate without a key.
+                                if api_key.is_none()
+                                    && pa_core::auth::AuthStorage::create(&self.config.agent_dir)
+                                        .has(&next.provider)
+                                {
                                     return Ok(CandidateSwitch::NoCredential);
                                 }
                                 Some(ProviderTarget {
