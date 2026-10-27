@@ -13,6 +13,8 @@ use pa_core::session_engine::rlm_notices::{
     create_rlm_children_resumed_notice, ChildResume, ChildResumeOutcome,
 };
 
+use crate::rlm_ledger::RlmLedgerEdge;
+
 use super::{
     bail, now_ms, Arc, ChildRecord, Duration, Mutex, Result, SupervisorChildSessionsInner,
 };
@@ -25,10 +27,26 @@ pub(super) const RESUME_WINDOW: Duration = Duration::from_hours(6);
 pub(super) const RESUME_PROMPT: &str = "Your run was interrupted: Prime Agent or your parent session restarted. Continue the interrupted task from the saved transcript. Processes and kernel state from before the restart are gone, so inspect the current state (files, branches, running commands) before redoing or retrying work.";
 
 /// Whether a child file last written at `modified` is recent enough to resume.
-pub(super) fn within_resume_window(modified: SystemTime) -> bool {
+fn within_resume_window(modified: SystemTime) -> bool {
     SystemTime::now()
         .duration_since(modified)
         .map_or(true, |age| age <= RESUME_WINDOW)
+}
+
+/// Whether the run behind a ledger edge was interrupted recently: its
+/// display still reads `running` (it never got a verdict from
+/// `record_settled_display`: the daemon or the parent stopped under it)
+/// and its session file changed inside [`RESUME_WINDOW`]. The stat runs
+/// first, so a boot scan over the whole ledger reads few display files.
+pub(crate) fn recently_interrupted(edge: &RlmLedgerEdge) -> bool {
+    let child = Path::new(&edge.child);
+    std::fs::metadata(child)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(within_resume_window)
+        && child
+            .parent()
+            .and_then(crate::rlm_ledger::read_rlm_subagent_display)
+            .is_some_and(|display| display.child_id == edge.child_id && display.status == "running")
 }
 
 impl SupervisorChildSessionsInner {
