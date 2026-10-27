@@ -574,6 +574,7 @@ fn ledger_child_records(
         });
     let mut records = Vec::new();
     for edge in edges {
+        let recently_interrupted = super::resume::recently_interrupted(&edge);
         let child = PathBuf::from(&edge.child);
         let session_id = child
             .file_stem()
@@ -582,15 +583,6 @@ fn ledger_child_records(
             .parent()
             .and_then(crate::rlm_ledger::read_rlm_subagent_display)
             .filter(|display| display.child_id == edge.child_id);
-        // A display still `running` names a run that never got a verdict
-        // (`record_settled_display`): the daemon or the parent stopped under it.
-        let interrupted = display
-            .as_ref()
-            .is_some_and(|display| display.status == "running");
-        let recently_interrupted = interrupted
-            && std::fs::metadata(&child)
-                .and_then(|metadata| metadata.modified())
-                .is_ok_and(super::resume::within_resume_window);
         let record = ChildRecord {
             rlm_child_id: edge.child_id,
             session_name: edge.name,

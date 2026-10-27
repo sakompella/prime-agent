@@ -6,6 +6,7 @@
 mod accept_loop;
 mod adoption;
 mod clients;
+mod interrupted_children;
 mod launch_budget;
 mod notes;
 mod options;
@@ -440,6 +441,7 @@ impl Supervisor {
             let supervisor = Arc::clone(&self);
             tokio::spawn(async move {
                 crate::update_restore::restore_pass(&supervisor, adoption, roster).await;
+                supervisor.wake_parents_of_interrupted_children().await;
             });
         }
 

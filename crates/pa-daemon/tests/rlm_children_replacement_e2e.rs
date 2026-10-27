@@ -31,6 +31,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+/// How the continuation prompt a resumed child gets begins.
+const RESUME_PROMPT_START: &str = "Your run was interrupted";
+
 struct Daemon {
     child: Child,
     #[allow(dead_code)]
@@ -570,8 +573,9 @@ fn a_daemon_restart_relists_and_wakes_the_parents_child() {
     restart_relists_child(0, "completed");
 }
 
-/// A child still mid-run when the daemon stopped is resumed by its
-/// reattached parent, which hears about it once.
+/// A child still mid-run when the daemon stopped is resumed at the next
+/// daemon start, before anything reopens its parent; the parent hears
+/// about it once, and a later reopen does not resume it again.
 #[test]
 fn a_daemon_restart_resumes_a_still_running_child() {
     restart_relists_child(30_000, "running");
@@ -693,6 +697,48 @@ fn restart_relists_child(delay_ms: u64, display_status: &str) {
     let (mut client, hello) = Client::connect(&socket);
     assert_eq!(hello["type"], "daemon_hello");
 
+    if display_status == "running" {
+        // Nothing reopens the parent: the boot wakes it, and its reseed
+        // resumes the child and tells the parent.
+        let occurrences = |file: &Path, needle: &str| {
+            std::fs::read_to_string(file)
+                .unwrap_or_default()
+                .matches(needle)
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_mins(1);
+        while occurrences(&child_file, RESUME_PROMPT_START) == 0
+            || occurrences(Path::new(&parent_file), "rlm_children_resumed") == 0
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the boot never resumed the child without its parent"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let woken = wait_until(&mut client, Duration::from_secs(30), |client| {
+            roster_summaries(client, "l2")
+                .into_iter()
+                .find(|summary| summary["sessionId"] == json!(parent_session_id))
+        });
+        // The reopen reuses the woken parent, so no second reseed runs.
+        let reopened = create_parent(
+            &mut client,
+            dir.path(),
+            &parent_script,
+            &child_script,
+            Some(Path::new(&parent_file)),
+            "c2",
+        );
+        assert_eq!(reopened["activeSessionId"], woken["activeSessionId"]);
+        assert_eq!(occurrences(&child_file, RESUME_PROMPT_START), 1);
+        assert_eq!(
+            occurrences(Path::new(&parent_file), "rlm_children_resumed"),
+            1
+        );
+        return;
+    }
+
     let probe_script = write_parent_script(
         dir.path(),
         &probe_cell(&list_receipt, &send_receipt, &probe_error),
@@ -726,31 +772,11 @@ fn restart_relists_child(delay_ms: u64, display_status: &str) {
     // (a) relisted
     let rows: Value =
         serde_json::from_str(&await_receipt(&list_receipt)).expect("list receipt json");
-    if display_status == "completed" {
-        assert_eq!(
-            rows,
-            json!([[child_id, "completed", child_session_id]]),
-            "the restarted parent must relist its ledger child with its persisted status"
-        );
-    } else {
-        // The resumed run is live again or already finished, never `error`.
-        assert!(
-            rows == json!([[child_id, "running", child_session_id]])
-                || rows == json!([[child_id, "completed", child_session_id]]),
-            "the restarted parent must resume its interrupted child: {rows}"
-        );
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !std::fs::read_to_string(&parent_file)
-            .unwrap_or_default()
-            .contains("rlm_children_resumed")
-        {
-            assert!(
-                Instant::now() < deadline,
-                "the parent never got the resume notice"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
+    assert_eq!(
+        rows,
+        json!([[child_id, "completed", child_session_id]]),
+        "the restarted parent must relist its ledger child with its persisted status"
+    );
     // (b) send receipt
     let _send: Value =
         serde_json::from_str(&await_receipt(&send_receipt)).expect("send receipt json");

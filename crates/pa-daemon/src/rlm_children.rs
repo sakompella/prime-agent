@@ -1143,6 +1143,8 @@ mod registry;
 mod resume;
 mod usage;
 
+pub(crate) use resume::recently_interrupted;
+
 #[cfg(test)]
 mod watch_tests;
 

@@ -344,7 +344,7 @@ impl Supervisor {
                             |info| (info.cwd, info.rlm_depth),
                         );
                 Some(
-                    self.launch_ledger_child_wake(&session_file, cwd, &edge.child_id, depth)
+                    self.launch_session_wake(&session_file, cwd, depth, Some(&edge.child_id))
                         .await,
                 )
             }
@@ -354,14 +354,15 @@ impl Supervisor {
         }
     }
 
-    /// Spawn one worker over a ledger child's session file, with the same
-    /// concurrent-wake protections as the saved-session wake.
-    async fn launch_ledger_child_wake(
+    /// Spawn one worker over a session file (a ledger child's when
+    /// `child_id` names it), with the same concurrent-wake protections as
+    /// the saved-session wake.
+    pub(crate) async fn launch_session_wake(
         self: &Arc<Self>,
         session_file: &str,
         cwd: String,
-        child_id: &str,
         depth: u32,
+        child_id: Option<&str>,
     ) -> WakeOutcome {
         // Reuse before spawning: a concurrent revival may already host the file.
         if let Some(resident) = self.registry.find_by_session_file(session_file).await {
@@ -380,7 +381,8 @@ impl Supervisor {
             // root and never re-passivates.
             config: Some(json!({ "cwd": cwd, "rlmDepth": depth })),
             telemetry_disabled: None,
-            runtime_metadata: Some(json!({ "kind": "subagent", "rlmChildId": child_id })),
+            runtime_metadata: child_id
+                .map(|child_id| json!({ "kind": "subagent", "rlmChildId": child_id })),
             lifecycle: None,
             env: None,
             launch_env: None,
