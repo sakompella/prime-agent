@@ -366,6 +366,15 @@ fn setup(
     primary: &FailingMock,
     backup: &FailingMock,
 ) -> (tempfile::TempDir, Supervisor, Client, String) {
+    setup_with_backup_key(name, primary, backup, "sk-backup")
+}
+
+fn setup_with_backup_key(
+    name: &str,
+    primary: &FailingMock,
+    backup: &FailingMock,
+    backup_api_key: &str,
+) -> (tempfile::TempDir, Supervisor, Client, String) {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let agent_dir = dir.path().join("agent");
     let session_dir = agent_dir.join("sessions");
@@ -391,7 +400,7 @@ fn setup(
                 "prime-backup": {
                     "api": "openai-completions",
                     "baseUrl": backup.url(),
-                    "apiKey": "sk-backup",
+                    "apiKey": backup_api_key,
                     "models": [
                         {
                             "id": "mock-1",
@@ -619,6 +628,83 @@ fn every_provider_failing_surfaces_the_final_error() {
         .expect("turn error")
         .contains("mock provider overloaded"));
     assert_eq!(turn_end.get("error"), None, "turn_end: {turn_end}");
+}
+
+/// hp 2026-10-27: a child resumed at boot, before the network was up, failed over from
+/// `cpa-claude` to the built-in `anthropic`, whose login had expired and could not refresh. The
+/// candidate list counts such a login as configured, so the turn switched to it and failed with
+/// "No API key for provider: anthropic". A candidate that resolves no key is never switched to.
+#[test]
+fn a_backup_whose_login_cannot_refresh_is_never_switched_to() {
+    let primary = FailingMock::start(usize::MAX, ReplyMode::Text("never reached"));
+    let backup = FailingMock::start(0, ReplyMode::Text("never reached"));
+    // `!false` resolves no models.json key, so only the expired login lists the backup.
+    let (dir, _supervisor, mut client, session_id) =
+        setup_with_backup_key("dead-login", &primary, &backup, "!false");
+    let agent_dir = dir.path().join("agent");
+    std::fs::write(
+        agent_dir.join("auth.json"),
+        json!({
+            "prime-backup": { "type": "oauth", "access": "expired", "refresh": "dead", "expires": 0 }
+        })
+        .to_string(),
+    )
+    .expect("write auth.json");
+    client.send_command(
+        "p1",
+        &json!({ "type": "prompt_and_wait", "activeSessionId": session_id, "message": "hi" }),
+    );
+    let done = client.request("p1");
+    assert_eq!(done["success"], false, "prompt must fail: {done}");
+    client.drain_events(Duration::from_secs(1));
+
+    assert_eq!(primary.count(), 2, "initial + 1 retry on the primary");
+    assert_eq!(backup.count(), 0);
+    assert!(
+        retry_starts(&client.events)
+            .iter()
+            .all(|start| start.get("reason").is_none()),
+        "no backup retry: {:?}",
+        client.events
+    );
+    let end = retry_end(&client.events);
+    assert_eq!(end["success"], false);
+    assert!(
+        end["finalError"]
+            .as_str()
+            .expect("final error")
+            .contains("mock provider overloaded"),
+        "the primary's own error: {end}"
+    );
+
+    let session_rows: Vec<Value> = std::fs::read_dir(agent_dir.join("sessions"))
+        .expect("session dir")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension()? == "jsonl").then_some(path)
+        })
+        .flat_map(|path| {
+            std::fs::read_to_string(path)
+                .expect("session file")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("session row"))
+                .collect::<Vec<Value>>()
+        })
+        .collect();
+    let model_changes: Vec<&Value> = session_rows
+        .iter()
+        .filter(|row| row["type"] == "model_change")
+        .collect();
+    assert!(
+        !model_changes.is_empty(),
+        "the session file holds its model rows"
+    );
+    assert!(
+        model_changes
+            .iter()
+            .all(|row| row["provider"] == "prime-inference"),
+        "the session never left its provider: {model_changes:?}"
+    );
 }
 
 #[test]

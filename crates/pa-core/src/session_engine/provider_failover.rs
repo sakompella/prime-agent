@@ -76,11 +76,20 @@ pub fn failover_retry_delay(
     )
 }
 
+/// What `switch` did with a failover candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateSwitch {
+    Switched,
+    /// The candidate resolved no credential (for example an expired login whose refresh failed):
+    /// the session stays on its current provider and the chain tries the next candidate.
+    NoCredential,
+}
+
 /// Drive one turn through the provider-failover chain. With failover disabled or no candidates this
 /// is exactly [`run_turn_with_auto_retry`] under `quick_policy`; otherwise each provider gets
 /// `failover.max_retries` quick retries, and a spent budget switches to the next candidate
-/// immediately. `switch` re-binds the session to a provider; `restore` hands the primary back and
-/// returns its `"provider/model-id"`.
+/// immediately. `switch` re-binds the session to a provider, or declines one that has no
+/// credential; `restore` hands the primary back and returns its `"provider/model-id"`.
 ///
 /// # Errors
 ///
@@ -109,7 +118,7 @@ where
     W: FnMut(std::time::Duration) -> WF,
     WF: Future<Output = bool>,
     S: FnMut(&Model) -> SF,
-    SF: Future<Output = anyhow::Result<()>>,
+    SF: Future<Output = anyhow::Result<CandidateSwitch>>,
     R: FnMut() -> RF,
     RF: Future<Output = anyhow::Result<Option<String>>>,
 {
@@ -213,7 +222,15 @@ where
             return Ok(message);
         }
         if retries_on_provider > failover.max_retries {
-            let Some(next) = candidates.get(candidate_index) else {
+            let mut switched_to = None;
+            while let Some(next) = candidates.get(candidate_index) {
+                candidate_index += 1;
+                if switch(next).await? == CandidateSwitch::Switched {
+                    switched_to = Some(next);
+                    break;
+                }
+            }
+            let Some(next) = switched_to else {
                 if switched {
                     let _ = restore().await?;
                 }
@@ -226,10 +243,8 @@ where
                 .await?;
                 return Ok(message);
             };
-            candidate_index += 1;
             retries_on_provider = 0;
             let backup_model = format!("{}/{}", next.provider, next.id);
-            switch(next).await?;
             switched = true;
             // The TS backup-model retry re-issues immediately (`delayMs: 0`).
             emit(AutoRetryEvent::Start {
@@ -433,6 +448,16 @@ mod tests {
         candidates: &[Model],
         script: Vec<AssistantMessage>,
     ) -> Harness {
+        drive_declining(failover, candidates, script, &[]).await
+    }
+
+    /// [`drive`] with `switch` declining the `no_credential` providers.
+    async fn drive_declining(
+        failover: &ProviderFailoverPolicy,
+        candidates: &[Model],
+        script: Vec<AssistantMessage>,
+        no_credential: &[&str],
+    ) -> Harness {
         let script = Arc::new(Mutex::new(script));
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let switches: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -483,12 +508,16 @@ mod tests {
                 move |next: &Model| {
                     let switches = Arc::clone(&switches);
                     let next = next.clone();
+                    let declined = no_credential.contains(&next.provider.as_str());
                     async move {
+                        if declined {
+                            return Ok(CandidateSwitch::NoCredential);
+                        }
                         switches
                             .lock()
                             .unwrap()
                             .push(format!("{}/{}", next.provider, next.id));
-                        Ok(())
+                        Ok(CandidateSwitch::Switched)
                     }
                 }
             },
@@ -628,6 +657,61 @@ mod tests {
                 && restored_model.as_deref() == Some("primary/glm-5.3")
         );
         assert!(shape_matches, "events: {:?}", harness.events);
+    }
+
+    #[tokio::test]
+    async fn a_candidate_without_a_credential_is_skipped_without_spending_budget() {
+        let failures = || error_message(Some("server_error"), Some(500), "primary down");
+        let recovering = vec![
+            failures(),
+            failures(),
+            failures(),
+            ok_message("on backup-b"),
+        ];
+        let harness = drive_declining(
+            &fast_failover(),
+            &[model("dead"), model("backup-b")],
+            recovering,
+            &["dead"],
+        )
+        .await;
+        assert_eq!(harness.attempts, 4);
+        assert_eq!(harness.switches, vec!["backup-b/glm-5.3"]);
+
+        let after_a_switch = (0..6).map(|_| failures()).collect();
+        let harness = drive_declining(
+            &fast_failover(),
+            &[model("backup-a"), model("dead")],
+            after_a_switch,
+            &["dead"],
+        )
+        .await;
+        assert_eq!(harness.attempts, 6);
+        assert_eq!(harness.switches, vec!["backup-a/glm-5.3"]);
+        assert_eq!(
+            harness.restores.len(),
+            1,
+            "the earlier switch restores once"
+        );
+
+        let exhausted = vec![failures(), failures(), failures()];
+        let harness =
+            drive_declining(&fast_failover(), &[model("dead")], exhausted, &["dead"]).await;
+        assert_eq!(harness.attempts, 3);
+        assert!(harness.switches.is_empty());
+        assert!(
+            harness.restores.is_empty(),
+            "nothing switched, nothing to restore"
+        );
+        assert!(
+            matches!(
+                harness.events.last(),
+                Some(AutoRetryEvent::End { success: false, final_error: Some(error), .. })
+                    if error == "primary down"
+            ),
+            "the turn fails with the primary's own error: {:?}",
+            harness.events
+        );
     }
 
     /// Operator ruling 2026-09-23: the chain gives up at
