@@ -324,6 +324,9 @@ impl IpythonKernelProvisioner {
                 },
             )
             .await?;
+        if result.status == ExecuteStatus::Aborted {
+            return Err(anyhow!("Python execution aborted"));
+        }
         if let Some(error) = result.error {
             // Only the exception: a traceback could quote the cell's token.
             tracing::warn!(
