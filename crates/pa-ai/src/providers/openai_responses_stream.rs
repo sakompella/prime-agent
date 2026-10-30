@@ -970,9 +970,14 @@ mod output_item_done_capture {
 
     /// Drive one hub turn through the processor.
     fn replay(events: &[Value]) -> AssistantMessage {
+        replay_with_events(events).0
+    }
+
+    /// Drive one hub turn through the processor and keep the events it emitted.
+    fn replay_with_events(events: &[Value]) -> (AssistantMessage, Vec<AssistantMessageEvent>) {
         let model = hub_model();
         let mut output = initial_assistant_message(&model.api, &model.provider, &model.id);
-        let (writer, _stream) = AssistantMessageEventStream::new();
+        let (writer, stream) = AssistantMessageEventStream::new();
         let mut processor = ResponsesStreamProcessor::new(
             &model,
             &mut output,
@@ -983,7 +988,10 @@ mod output_item_done_capture {
             processor.handle_event(event).expect("stream event");
         }
         processor.finish().expect("stream finish");
-        output
+        drop(processor);
+        writer.end(None);
+        let emitted = futures::executor::block_on(stream.collect());
+        (output, emitted)
     }
 
     fn block(output: &AssistantMessage, index: usize) -> &AssistantContent {
@@ -1093,6 +1101,8 @@ mod output_item_done_capture {
     }
 
     /// An empty `arguments` on the done item must not overwrite the streamed ones with `{}`.
+    /// This is the one test that fails on the half fix, which reads the content index before
+    /// dropping the slot but never reads the slot's `partial_json`.
     #[test]
     fn indexed_function_call_done_keeps_the_accumulated_arguments() {
         let output = replay(&[
@@ -1113,7 +1123,7 @@ mod output_item_done_capture {
     /// Control: without `output_index` on `done` the processor falls back to the last index it
     /// saw, so this shape captured the item even before the slot-order fix.
     #[test]
-    fn done_without_output_index_still_keeps_the_reasoning_item() {
+    fn control_done_without_output_index_keeps_the_reasoning_item() {
         let mut events = reasoning_events();
         events
             .last_mut()
@@ -1134,10 +1144,28 @@ mod output_item_done_capture {
         );
     }
 
-    /// Only a captured item replays the reasoning into the next request, which is the point of
-    /// keeping the signature at all.
+    /// The capture is what lets the next request replay the turn: the items come back in wire
+    /// order, with the ids and the reasoning blob the provider needs.
     #[test]
-    fn captured_reasoning_item_replays_into_the_next_request() {
+    fn captured_items_replay_into_the_next_request_in_order() {
+        let mut events = reasoning_events();
+        events.extend([
+            json!({"type": "response.output_item.added", "output_index": 1,
+                   "item": {"type": "message", "id": "msg_fixture", "role": "assistant",
+                            "status": "in_progress", "content": []}}),
+            json!({"type": "response.content_part.added", "output_index": 1, "content_index": 0,
+                   "part": {"type": "output_text", "text": "", "annotations": []}}),
+            json!({"type": "response.output_text.delta", "output_index": 1, "content_index": 0,
+                   "delta": "$0.05"}),
+            json!({"type": "response.output_item.done", "output_index": 1,
+                   "item": {"type": "message", "id": "msg_fixture", "role": "assistant",
+                            "status": "completed", "phase": "final_answer",
+                            "content": [{"type": "output_text", "text": "$0.05"}]}}),
+            json!({"type": "response.output_item.added", "output_index": 2,
+                   "item": function_call_item("")}),
+            json!({"type": "response.output_item.done", "output_index": 2,
+                   "item": function_call_item("{\"cmd\":\"ls\"}")}),
+        ]);
         let context = Context {
             system_prompt: Some("You are a helpful assistant.".into()),
             messages: vec![
@@ -1146,7 +1174,7 @@ mod output_item_done_capture {
                     timestamp: 0,
                     rest: Map::default(),
                 }),
-                Message::Assistant(replay(&reasoning_events())),
+                Message::Assistant(replay(&events)),
             ],
             tools: None,
         };
@@ -1156,10 +1184,49 @@ mod output_item_done_capture {
             &[],
             ConvertResponsesMessagesOptions::default(),
         );
-        let items_json = serde_json::to_string(&items).unwrap();
-        assert!(
-            items_json.contains(ENCRYPTED),
-            "the reasoning item never reached the follow-up request: {items_json}"
+        // The user turn carries no `type`, the assistant items follow in wire order, and the
+        // unanswered tool call gets the synthetic result that `transform_messages` inserts.
+        let kinds: Vec<Option<&str>> = items
+            .iter()
+            .map(|item| item.get("type").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                None,
+                Some("reasoning"),
+                Some("message"),
+                Some("function_call"),
+                Some("function_call_output")
+            ]
         );
+        assert_eq!(items[1].get("id"), Some(&json!("rs_fixture")));
+        assert_eq!(items[1].get("encrypted_content"), Some(&json!(ENCRYPTED)));
+        assert_eq!(items[2].get("id"), Some(&json!("msg_fixture")));
+        assert_eq!(items[2].get("phase"), Some(&json!("final_answer")));
+    }
+
+    /// A repeated `done` for an item that is already settled must not emit a second end event.
+    /// This is the fallback shape, which used to leave the slot in the map.
+    #[test]
+    fn a_duplicate_done_emits_no_second_end_event() {
+        let mut events = reasoning_events();
+        let done = events.last_mut().expect("done event");
+        done.as_object_mut()
+            .expect("done object")
+            .remove("output_index");
+        let repeated = events.last().expect("done event").clone();
+        events.push(repeated);
+        let (output, emitted) = replay_with_events(&events);
+        let ends = emitted
+            .iter()
+            .filter(|event| matches!(event, AssistantMessageEvent::ThinkingEnd { .. }))
+            .count();
+        assert_eq!(ends, 1, "{emitted:?}");
+        assert_eq!(output.content.len(), 1);
+        match block(&output, 0) {
+            AssistantContent::Thinking(thinking) => assert_eq!(thinking.thinking, REASONING_TEXT),
+            other => panic!("expected a thinking block, got {other:?}"),
+        }
     }
 }
