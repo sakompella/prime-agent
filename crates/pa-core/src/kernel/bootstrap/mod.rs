@@ -16,7 +16,8 @@ use anyhow::{anyhow, Context};
 
 use dir_lock::acquire_bootstrap_lock;
 pub use runtime_code::{
-    build_rlm_bootstrap_code, parse_unavailable_python_skills, UnavailablePythonSkills,
+    build_rlm_bootstrap_code, parse_unavailable_python_skills, t3_rebind_code,
+    UnavailablePythonSkills,
     PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER,
 };
 use venv::{

@@ -485,6 +485,90 @@ fn the_kernel_runs_in_the_client_launch_env() {
     );
 }
 
+/// A client that reuses a live worker brings its own T3 connection (T3
+/// Code reopening a session the daemon woke on its own, with no client
+/// env): the running kernel gets it before the next turn's cell, with `t3`
+/// bound, and the model is told once. Without it, every later cell ran on
+/// the waker's env and `t3` said there was no connection.
+#[test]
+fn a_reusing_client_gives_the_live_kernel_its_t3_connection() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    let receipt = |turn: &str| dir.path().join(format!("t3-receipt-{turn}.txt"));
+    let cell = |turn: &str| {
+        format!(
+            "import os\nopen({:?}, \"w\").write(f\"{{os.environ.get('T3_MCP_URL', 'ABSENT')}} {{'t3' in globals()}}\")",
+            receipt(turn).to_string_lossy()
+        )
+    };
+    let tool_turn = |turn: &str| {
+        json!({ "content": [
+            { "type": "toolCall", "name": "python_repl", "arguments": { "code": cell(turn) } },
+        ] })
+    };
+    let script = dir.path().join("t3-reuse-script.json");
+    std::fs::write(
+        &script,
+        json!({
+            "engine": "faux",
+            "responses": [tool_turn("woken"), { "text": "done" }, tool_turn("reopened"), { "text": "done" }],
+        })
+        .to_string(),
+    )
+    .expect("write faux script");
+    let read_receipt = |turn: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(content) = std::fs::read_to_string(receipt(turn)) {
+                return content;
+            }
+            assert!(Instant::now() < deadline, "the {turn} cell never ran");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let _daemon = spawn_supervisor(&socket, &agent_dir, Some(&kernel_python));
+    wait_socket_ready(&socket);
+
+    // The daemon's own wake: no client env, so no T3 connection.
+    let (mut waker, _) = Client::connect(&socket);
+    let (session, session_file) =
+        create_session(&mut waker, dir.path(), &script, "woken", json!({}));
+    run_one_turn(&mut waker, &session, "woken");
+    assert_eq!(read_receipt("woken"), "ABSENT False");
+
+    // T3 Code reopens it, reusing the live worker and its running kernel.
+    let url = "http://127.0.0.1:9/mcp";
+    let (mut t3, _) = Client::connect(&socket);
+    let reopened = t3.request(
+        "reopen",
+        &json!({
+            "type": "create",
+            "lifecycle": "client_owned",
+            "sessionPath": session_file,
+            "config": { "cwd": dir.path().to_string_lossy() },
+            "launchEnv": { "T3_MCP_URL": url, "T3_MCP_BEARER_TOKEN": "t3-token" },
+        }),
+    );
+    assert_eq!(reopened["success"], true, "reopen failed: {reopened}");
+    assert_eq!(reopened["data"]["activeSessionId"], json!(session));
+    run_one_turn(&mut t3, &session, "reopened");
+    assert_eq!(read_receipt("reopened"), format!("{url} True"));
+
+    let messages = t3.request(
+        "messages",
+        &json!({ "type": "get_messages", "activeSessionId": session }),
+    );
+    assert_eq!(
+        messages.to_string().matches("\"t3_code_connected\"").count(),
+        1,
+        "the model must be told once that T3 is connected: {messages}"
+    );
+}
+
 /// An `rlm.spawn` child is a separate worker process in the Rust port;
 /// TS runs it in-process inside the parent worker. Parity: the child
 /// create forwards the parent worker's own env (filtered), so the child

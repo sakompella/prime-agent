@@ -104,6 +104,49 @@ except Exception as _prime_agent_t3_error:
     t3 = _PrimeAgentMissingT3()
 "#;
 
+/// The cell that moves a live kernel onto another T3 connection: its `T3_*`
+/// env becomes exactly `t3_env` (keys outside `T3_*` are ignored), and when
+/// that connects to T3, `t3` is bound (an already imported `rlm.t3` relists
+/// its tools first).
+#[must_use]
+pub fn t3_rebind_code(t3_env: &std::collections::BTreeMap<String, String>) -> String {
+    let t3_env: std::collections::BTreeMap<String, String> = t3_env
+        .iter()
+        .filter(|(key, _)| key.starts_with("T3_"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    // A JSON object of strings is also a Python dict literal.
+    let env_literal = serde_json::to_string(&t3_env).unwrap_or_else(|_| "{}".to_string());
+    let mut code = format!(
+        r#"
+def _prime_agent_rebind_t3_env(env):
+    import os
+    for key in [key for key in os.environ if key.startswith("T3_")]:
+        del os.environ[key]
+    os.environ.update(env)
+
+_prime_agent_rebind_t3_env({env_literal})
+del _prime_agent_rebind_t3_env
+"#
+    );
+    let connects = T3Code::from_env(|key| t3_env.get(key).cloned()) == T3Code::Present;
+    if connects {
+        code.push_str(
+            r#"
+import sys as _prime_agent_sys
+if "rlm.t3" in _prime_agent_sys.modules:
+    try:
+        import importlib as _prime_agent_importlib
+        _prime_agent_importlib.reload(_prime_agent_sys.modules["rlm.t3"])
+    except Exception:
+        pass
+"#,
+        );
+        code.push_str(RLM_BOOTSTRAP_T3_CODE);
+    }
+    code
+}
+
 /// The code the session injects right after kernel start/restore: binds the `rlm`, `bash`, and MCP
 /// surfaces (plus `t3` in T3 sessions), imports every Python skill. `bash_notices_wired` emits
 /// the bounded-await toggle only when the host registers the bash completion notice.
@@ -304,6 +347,63 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(stdout.contains("t3 is broken"), "{stdout}");
+    }
+
+    /// The rebind cell, run in a kernel that already imported `rlm.t3` without a
+    /// connection (as a woken session's agent may have): the stale `T3_*` var is
+    /// gone, the new ones are set, `rlm.t3` relists on them, and `t3` is bound.
+    /// Without credentials the cell only sets the env.
+    #[test]
+    fn the_t3_rebind_cell_moves_the_kernel_onto_the_new_connection() {
+        let runtime = tempfile::tempdir().expect("temp dir");
+        let package = runtime.path().join("rlm");
+        std::fs::create_dir_all(&package).expect("package dir");
+        std::fs::write(package.join("__init__.py"), "").expect("rlm package");
+        std::fs::write(
+            package.join("t3.py"),
+            "import builtins, os\nbuiltins.t3_listings = getattr(builtins, 't3_listings', []) + [os.environ.get('T3_MCP_URL')]\n",
+        )
+        .expect("rlm.t3");
+        let connected = std::collections::BTreeMap::from([
+            ("T3_MCP_URL".to_string(), "http://t3.test/mcp".to_string()),
+            ("T3_MCP_BEARER_TOKEN".to_string(), "tok\"en".to_string()),
+            ("PATH".to_string(), "/ignored".to_string()),
+        ]);
+        let disconnected =
+            std::collections::BTreeMap::from([("T3_PI_RUNTIME_MODE".to_string(), "x".to_string())]);
+        let report = "import builtins, os\nprint(sorted((k, v) for k, v in os.environ.items() if k.startswith('T3_')), builtins.t3_listings, 't3' in globals(), os.environ['PATH'] != '/ignored')";
+        for (env, expected) in [
+            (
+                &connected,
+                "[('T3_MCP_BEARER_TOKEN', 'tok\"en'), ('T3_MCP_URL', 'http://t3.test/mcp')] [None, 'http://t3.test/mcp'] True True",
+            ),
+            (
+                &disconnected,
+                "[('T3_PI_RUNTIME_MODE', 'x')] [None] False True",
+            ),
+        ] {
+            let code = format!("import rlm.t3\n{}\n{report}\n", t3_rebind_code(env));
+            let output = match std::process::Command::new("python3")
+                .args(["-c", &code])
+                .env("PYTHONPATH", runtime.path())
+                .env("T3_STALE", "old")
+                .env_remove("T3_MCP_URL")
+                .env_remove("T3_MCP_BEARER_TOKEN")
+                .output()
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    eprintln!("python3 unavailable ({error}); skipping");
+                    return;
+                }
+            };
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+        }
     }
 
     /// The TS #2381 parser table: marker+JSON, noise-prefixed marker, no marker, non-JSON payload

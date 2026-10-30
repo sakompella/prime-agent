@@ -1056,11 +1056,15 @@ async fn start_kernel_impl(
     let snapshot_dir = options.snapshot_dir.clone();
     // The bounded-await default keys on the bash.completed host handler:
     // one source of truth (the registry the daemon registers the notice in).
-    // The kernel sees the process env overlaid with `options.env`.
+    // The kernel sees the process env overlaid with the session's own
+    // T3 connection, then with `options.env`.
+    let mut env: HashMap<String, String> =
+        pa_types::daemon::launch_env::session_env_overrides()
+            .into_iter()
+            .collect();
+    env.extend(options.env.clone());
     let t3_code = crate::T3Code::from_env(|key| {
-        options
-            .env
-            .get(key)
+        env.get(key)
             .cloned()
             .or_else(|| std::env::var(key).ok())
     });
@@ -1072,7 +1076,6 @@ async fn start_kernel_impl(
             .is_some(),
         t3_code,
     );
-    let mut env = options.env.clone();
     if let Some(shell_path) = &options.shell_path {
         env.insert(
             "PRIME_AGENT_BASH_SHELL".into(),

@@ -218,7 +218,7 @@ impl Supervisor {
                             ..
                         } = command
                         {
-                            resident.rebind_session_env(launch_env);
+                            self.apply_client_session_env(resident, launch_env).await;
                         }
                         return Ok(Some(summary));
                     }
@@ -253,6 +253,46 @@ impl Supervisor {
                 );
             }
             self.await_holder_gone(&holder, &path_text).await?;
+        }
+    }
+
+    /// Give a reused worker and its resident RLM children the reusing
+    /// client's session-scoped vars (T3's connection): a later respawn
+    /// through the stored launch env, the live process through
+    /// `apply_session_env`. A worker the daemon woke on its own has none, and
+    /// its children inherited that.
+    async fn apply_client_session_env(
+        self: &Arc<Self>,
+        resident: &Arc<ResidentWorker>,
+        launch_env: &std::collections::BTreeMap<String, String>,
+    ) {
+        let payload = json!({
+            "env": pa_types::daemon::launch_env::session_scoped_env(launch_env),
+        });
+        let mut workers = vec![Arc::clone(resident)];
+        while let Some(worker) = workers.pop() {
+            worker.rebind_session_env(launch_env);
+            let outcome = self
+                .route_command_typed(
+                    &worker,
+                    "apply_session_env",
+                    payload.clone(),
+                    ROUTE_TIMEOUT_MS,
+                    RouteAdmission::SupervisorInternal,
+                )
+                .await;
+            let failure = match outcome {
+                Ok(response) if response.success => None,
+                Ok(response) => Some(response.error.unwrap_or_default()),
+                Err(error) => Some(format!("{error:#}")),
+            };
+            if let Some(failure) = failure {
+                self.log_line(&format!(
+                    "session worker {} kept its T3 connection: {failure}",
+                    worker.worker_id
+                ));
+            }
+            workers.extend(self.resident_children_of(&worker).await);
         }
     }
 
