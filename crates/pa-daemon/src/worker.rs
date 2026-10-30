@@ -47,6 +47,7 @@ pub(crate) use summary::{
 use turn::TurnRunner;
 
 mod commands;
+mod t3_env;
 
 pub use env::{
     strip_inherited_worker_env, WORKER_ACTIVE_SESSION_ID_ENV, WORKER_CWD_ENV,

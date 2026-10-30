@@ -359,7 +359,8 @@ impl IpythonKernelProvisioner for KernelProvisioner {
             // The tool contract uses the raw cancellation token; the kernel
             // wraps it in its own abort signal.
             let signal = signal.map(crate::kernel::cancellation::AbortSignal::from_token);
-            let manager = this.ensure(on_progress, signal).await?;
+            let manager = this.ensure(on_progress, signal.clone()).await?;
+            this.sync_session_env(&manager, signal).await?;
             let cell_timeout_ms = this.cell_timeout_ms();
             Ok(Box::new(KernelManagerExecutor {
                 manager,

@@ -42,15 +42,83 @@ pub fn collect_launch_env(
         .collect()
 }
 
-/// Collect the launch env from THIS process's environment. Entries that
-/// are not valid UTF-8 are skipped: the JSON wire cannot carry them,
+/// Collect the launch env from THIS process's environment, with its
+/// session-scoped vars as [`replace_session_env`] last set them. Entries
+/// that are not valid UTF-8 are skipped: the JSON wire cannot carry them,
 /// and `std::env::vars` would panic on them.
 #[must_use]
 pub fn collect_process_launch_env() -> BTreeMap<String, String> {
-    collect_launch_env(
+    let mut env = collect_launch_env(
         std::env::vars_os()
             .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?))),
-    )
+    );
+    if let Some(replaced) = replaced_session_env().as_ref() {
+        env.retain(|key, _| !is_session_scoped(key));
+        env.extend(replaced.clone());
+    }
+    env
+}
+
+/// The session-scoped vars that replaced this process's own, once a
+/// client reusing a live worker brought a different T3 connection. The
+/// process env itself is never written: other threads may read it.
+static REPLACED_SESSION_ENV: std::sync::RwLock<Option<BTreeMap<String, String>>> =
+    std::sync::RwLock::new(None);
+
+fn replaced_session_env() -> std::sync::RwLockReadGuard<'static, Option<BTreeMap<String, String>>> {
+    REPLACED_SESSION_ENV
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// How many times [`replace_session_env`] ran in this process: a kernel
+/// started at an older count must be moved onto the current set.
+static SESSION_ENV_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Make `env`'s session-scoped vars this process's whole session-scoped
+/// set: a var the process env has and `env` lacks reads as unset.
+pub fn replace_session_env(env: &BTreeMap<String, String>) {
+    let mut replaced = REPLACED_SESSION_ENV
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *replaced = Some(session_scoped_env(env));
+    SESSION_ENV_VERSION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The count of [`replace_session_env`] calls so far. Read it before the
+/// env it describes: a replacement in between then only causes one more
+/// move onto the same set.
+#[must_use]
+pub fn session_env_version() -> u64 {
+    SESSION_ENV_VERSION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// One var as this process's session sees it: a session-scoped var from
+/// the last [`replace_session_env`], anything else from the process env.
+#[must_use]
+pub fn session_var(key: &str) -> Option<String> {
+    match replaced_session_env().as_ref() {
+        Some(replaced) if is_session_scoped(key) => replaced.get(key).cloned(),
+        _ => std::env::var(key).ok(),
+    }
+}
+
+/// The overrides a process spawned with this process's env needs so it
+/// sees the session-scoped vars [`session_var`] reports: empty until
+/// [`replace_session_env`] runs, then the replaced set plus an empty value
+/// for each process-env session var the replacement dropped.
+#[must_use]
+pub fn session_env_overrides() -> BTreeMap<String, String> {
+    let Some(replaced) = replaced_session_env().clone() else {
+        return BTreeMap::new();
+    };
+    let mut overrides: BTreeMap<String, String> = std::env::vars_os()
+        .filter_map(|(key, _)| key.into_string().ok())
+        .filter(|key| is_session_scoped(key))
+        .map(|key| (key, String::new()))
+        .collect();
+    overrides.extend(replaced);
+    overrides
 }
 
 /// Whether a var belongs to one session's client rather than the daemon:
@@ -74,6 +142,37 @@ pub fn session_scoped_env(env: &BTreeMap<String, String>) -> BTreeMap<String, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// After a replacement the session-scoped vars are exactly the
+    /// replacement's, for reads, for a spawned child's launch env, and for a
+    /// process inheriting this one's env; other vars stay the process's.
+    /// The only test in this binary that touches the process-wide state.
+    #[test]
+    fn a_replaced_session_env_is_the_whole_session_scoped_set() {
+        let path = std::env::var("PATH").ok();
+        replace_session_env(&BTreeMap::from([
+            ("T3_MCP_URL".to_string(), "http://t3".to_string()),
+            ("PATH".to_string(), "/not-session-scoped".to_string()),
+        ]));
+        assert_eq!(session_var("T3_MCP_URL").as_deref(), Some("http://t3"));
+        assert_eq!(session_var("T3_MCP_BEARER_TOKEN"), None);
+        assert_eq!(session_var("PATH"), path);
+        let launch_env = collect_process_launch_env();
+        assert_eq!(
+            session_scoped_env(&launch_env),
+            BTreeMap::from([("T3_MCP_URL".to_string(), "http://t3".to_string())])
+        );
+        assert_eq!(launch_env.get("PATH"), path.as_ref());
+        let overrides = session_env_overrides();
+        assert_eq!(
+            overrides.get("T3_MCP_URL").map(String::as_str),
+            Some("http://t3")
+        );
+        assert!(overrides.keys().all(|key| is_session_scoped(key)));
+        assert!(overrides
+            .iter()
+            .all(|(key, value)| key == "T3_MCP_URL" || value.is_empty()));
+    }
 
     /// The client side forwards everything except the daemon-internal
     /// vars: no other var is special-cased (the whole point of the

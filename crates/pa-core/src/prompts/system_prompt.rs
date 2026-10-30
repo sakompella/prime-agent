@@ -257,7 +257,7 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
     }
 }
 
-const T3_CODE_SECTION: &str = "# T3 Code\n\nThis session runs in T3 Code. The pre-imported Python `t3` module calls T3's tools as async methods, for example `await t3.project_list()`.\nBefore the first T3 call, read `help(t3)` for the method index and errors, then `help(t3.<method>)` for that method's parameters.";
+pub const T3_CODE_SECTION: &str = "# T3 Code\n\nThis session runs in T3 Code. The pre-imported Python `t3` module calls T3's tools as async methods, for example `await t3.project_list()`.\nBefore the first T3 call, read `help(t3)` for the method index and errors, then `help(t3.<method>)` for that method's parameters.";
 
 fn packages_section() -> String {
     use crate::kernel::bootstrap::default_rlm_extra_import_labels;
