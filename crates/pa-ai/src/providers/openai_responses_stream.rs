@@ -495,14 +495,17 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 }
             }
             "response.output_item.done" => {
+                // This event closes the item, so take its slot: the handlers below still read the
+                // slot's content index and, for a function call, its accumulated arguments.
+                let slot = output_index
+                    .or(self.current_output_index)
+                    .and_then(|index| self.slots.remove(&index));
                 let item = event.get("item").cloned().unwrap_or(Value::Null);
                 let item_type = item
                     .get("type")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
-                let content_index = self
-                    .current_slot(output_index)
-                    .map(|slot| slot.content_index);
+                let content_index = slot.as_ref().map(|slot| slot.content_index);
                 match item_type {
                     "reasoning" => {
                         if let Some(content_index) = content_index {
@@ -613,18 +616,12 @@ impl<'a> ResponsesStreamProcessor<'a> {
                         }
                     }
                     "function_call" => {
-                        let content_index = content_index.or_else(|| {
-                            output_index
-                                .and_then(|index| self.slots.get(&index))
-                                .map(|slot| slot.content_index)
-                        });
                         if let Some(content_index) = content_index {
                             if self.block_kind(content_index) == Some("toolCall") {
-                                let slot_json =
-                                    match self.slots.get(&output_index.unwrap_or_default()) {
-                                        Some(slot) => slot.partial_json.text().to_string(),
-                                        None => String::new(),
-                                    };
+                                let slot_json = slot
+                                    .as_ref()
+                                    .map(|slot| slot.partial_json.text().to_string())
+                                    .unwrap_or_default();
                                 let arguments_text = item
                                     .get("arguments")
                                     .and_then(|value| value.as_str())
@@ -711,11 +708,6 @@ impl<'a> ResponsesStreamProcessor<'a> {
                         }
                     }
                     _ => {}
-                }
-                // The handlers above still read this slot: its content index, and for a
-                // function call its accumulated arguments. Drop it only once they are done.
-                if let Some(index) = output_index {
-                    self.slots.remove(&index);
                 }
             }
             "response.completed" | "response.incomplete" => {
