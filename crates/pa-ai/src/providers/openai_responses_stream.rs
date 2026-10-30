@@ -495,17 +495,17 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 }
             }
             "response.output_item.done" => {
-                if let Some(index) = output_index {
-                    self.slots.remove(&index);
-                }
+                // This event closes the item, so take its slot: the handlers below still read the
+                // slot's content index and, for a function call, its accumulated arguments.
+                let slot = output_index
+                    .or(self.current_output_index)
+                    .and_then(|index| self.slots.remove(&index));
                 let item = event.get("item").cloned().unwrap_or(Value::Null);
                 let item_type = item
                     .get("type")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
-                let content_index = self
-                    .current_slot(output_index)
-                    .map(|slot| slot.content_index);
+                let content_index = slot.as_ref().map(|slot| slot.content_index);
                 match item_type {
                     "reasoning" => {
                         if let Some(content_index) = content_index {
@@ -616,18 +616,12 @@ impl<'a> ResponsesStreamProcessor<'a> {
                         }
                     }
                     "function_call" => {
-                        let content_index = content_index.or_else(|| {
-                            output_index
-                                .and_then(|index| self.slots.get(&index))
-                                .map(|slot| slot.content_index)
-                        });
                         if let Some(content_index) = content_index {
                             if self.block_kind(content_index) == Some("toolCall") {
-                                let slot_json =
-                                    match self.slots.get(&output_index.unwrap_or_default()) {
-                                        Some(slot) => slot.partial_json.text().to_string(),
-                                        None => String::new(),
-                                    };
+                                let slot_json = slot
+                                    .as_ref()
+                                    .map(|slot| slot.partial_json.text().to_string())
+                                    .unwrap_or_default();
                                 let arguments_text = item
                                     .get("arguments")
                                     .and_then(|value| value.as_str())
@@ -938,5 +932,301 @@ fn map_responses_stop_reason(status: Option<&str>) -> StopReason {
         None | Some("completed" | "in_progress" | "queued") => StopReason::Stop,
         Some("incomplete") => StopReason::Length,
         Some(_) => StopReason::Error,
+    }
+}
+
+#[cfg(test)]
+mod output_item_done_capture {
+    use super::*;
+    use crate::event_stream::{initial_assistant_message, AssistantMessageEventStream};
+    use crate::providers::openai_responses_shared::{
+        convert_responses_messages, ConvertResponsesMessagesOptions,
+    };
+    use crate::types::{Context, Message, UserMessage, UserMessageContent};
+
+    /// Stands in for the hub's encrypted reasoning blob; only its round trip matters here.
+    const ENCRYPTED: &str = "gAAAAABfixture-encrypted-content-blob";
+    const REASONING_TEXT: &str = "Check the count.";
+
+    fn hub_model() -> Model {
+        Model {
+            id: "gpt-6-luna".into(),
+            name: "GPT-6 Luna".into(),
+            api: "openai-responses".into(),
+            provider: "cpa-codex".into(),
+            base_url: "https://hub.example/v1".into(),
+            reasoning: true,
+            thinking_level_map: None,
+            input: vec![crate::types::ModelInput::Text],
+            cost: crate::types::zero_model_cost(),
+            context_window: 350_000,
+            max_tokens: 128_000,
+            max_tokens_explicit: false,
+            featured: None,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    /// Drive one hub turn through the processor.
+    fn replay(events: &[Value]) -> AssistantMessage {
+        replay_with_events(events).0
+    }
+
+    /// Drive one hub turn through the processor and keep the events it emitted.
+    fn replay_with_events(events: &[Value]) -> (AssistantMessage, Vec<AssistantMessageEvent>) {
+        let model = hub_model();
+        let mut output = initial_assistant_message(&model.api, &model.provider, &model.id);
+        let (writer, stream) = AssistantMessageEventStream::new();
+        let mut processor = ResponsesStreamProcessor::new(
+            &model,
+            &mut output,
+            &writer,
+            ResponsesStreamHooks::default(),
+        );
+        for event in events {
+            processor.handle_event(event).expect("stream event");
+        }
+        processor.finish().expect("stream finish");
+        drop(processor);
+        writer.end(None);
+        let emitted = futures::executor::block_on(stream.collect());
+        (output, emitted)
+    }
+
+    fn block(output: &AssistantMessage, index: usize) -> &AssistantContent {
+        output
+            .content
+            .get(index)
+            .unwrap_or_else(|| panic!("missing content block {index}: {:?}", output.content))
+    }
+
+    fn reasoning_item() -> Value {
+        json!({
+            "type": "reasoning",
+            "id": "rs_fixture",
+            "summary": [{"type": "summary_text", "text": REASONING_TEXT}],
+            "content": [],
+            "encrypted_content": ENCRYPTED,
+        })
+    }
+
+    fn function_call_item(arguments: &str) -> Value {
+        json!({
+            "type": "function_call",
+            "id": "fc_fixture",
+            "call_id": "call_fixture",
+            "name": "bash",
+            "arguments": arguments,
+        })
+    }
+
+    /// A reasoning item streamed the way the hub sends it: summary deltas, then the completed
+    /// item on `response.output_item.done`, which carries its own `output_index`.
+    fn reasoning_events() -> Vec<Value> {
+        vec![
+            json!({"type": "response.created", "response": {"id": "resp_fixture"}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "reasoning", "id": "rs_fixture", "summary": [], "content": []}}),
+            json!({"type": "response.reasoning_summary_part.added", "output_index": 0,
+                   "summary_index": 0, "part": {"type": "summary_text", "text": ""}}),
+            json!({"type": "response.reasoning_summary_text.delta", "output_index": 0,
+                   "summary_index": 0, "delta": REASONING_TEXT}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": reasoning_item()}),
+        ]
+    }
+
+    #[test]
+    fn indexed_done_keeps_the_completed_reasoning_item() {
+        let output = replay(&reasoning_events());
+        let thinking = match block(&output, 0) {
+            AssistantContent::Thinking(thinking) => thinking,
+            other => panic!("expected a thinking block, got {other:?}"),
+        };
+        assert_eq!(thinking.thinking, REASONING_TEXT);
+        let signature = thinking
+            .thinking_signature
+            .as_deref()
+            .expect("the completed reasoning item was not kept as the thinking signature");
+        assert_eq!(
+            serde_json::from_str::<Value>(signature).unwrap(),
+            reasoning_item()
+        );
+    }
+
+    #[test]
+    fn indexed_done_keeps_the_message_text_signature() {
+        let output = replay(&[
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "message", "id": "msg_fixture", "role": "assistant",
+                            "status": "in_progress", "content": []}}),
+            json!({"type": "response.content_part.added", "output_index": 0, "content_index": 0,
+                   "part": {"type": "output_text", "text": "", "annotations": []}}),
+            json!({"type": "response.output_text.delta", "output_index": 0, "content_index": 0,
+                   "delta": "$0.05"}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"type": "message", "id": "msg_fixture", "role": "assistant",
+                            "status": "completed", "phase": "final_answer",
+                            "content": [{"type": "output_text", "text": "$0.05"}]}}),
+        ]);
+        let text = match block(&output, 0) {
+            AssistantContent::Text(text) => text,
+            other => panic!("expected a text block, got {other:?}"),
+        };
+        assert_eq!(text.text, "$0.05");
+        let signature: Value = serde_json::from_str(
+            text.text_signature
+                .as_deref()
+                .expect("the completed message was not kept as the text signature"),
+        )
+        .unwrap();
+        assert_eq!(signature.get("id"), Some(&json!("msg_fixture")));
+        assert_eq!(signature.get("phase"), Some(&json!("final_answer")));
+    }
+
+    #[test]
+    fn indexed_function_call_done_supplies_arguments_without_argument_events() {
+        let output = replay(&[
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": function_call_item("")}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": function_call_item("{\"cmd\":\"ls\"}")}),
+        ]);
+        let tool_call = match block(&output, 0) {
+            AssistantContent::ToolCall(tool_call) => tool_call,
+            other => panic!("expected a tool call, got {other:?}"),
+        };
+        assert_eq!(tool_call.id, "call_fixture|fc_fixture");
+        assert_eq!(tool_call.arguments.get("cmd"), Some(&json!("ls")));
+    }
+
+    /// An empty `arguments` on the done item must not overwrite the streamed ones with `{}`.
+    /// This is the one test that fails on the half fix, which reads the content index before
+    /// dropping the slot but never reads the slot's `partial_json`.
+    #[test]
+    fn indexed_function_call_done_keeps_the_accumulated_arguments() {
+        let output = replay(&[
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": function_call_item("")}),
+            json!({"type": "response.function_call_arguments.delta", "output_index": 0,
+                   "delta": "{\"cmd\":\"ls\"}"}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": function_call_item("")}),
+        ]);
+        let tool_call = match block(&output, 0) {
+            AssistantContent::ToolCall(tool_call) => tool_call,
+            other => panic!("expected a tool call, got {other:?}"),
+        };
+        assert_eq!(tool_call.arguments.get("cmd"), Some(&json!("ls")));
+    }
+
+    /// Control: without `output_index` on `done` the processor falls back to the last index it
+    /// saw, so this shape captured the item even before the slot-order fix.
+    #[test]
+    fn control_done_without_output_index_keeps_the_reasoning_item() {
+        let mut events = reasoning_events();
+        events
+            .last_mut()
+            .and_then(|event| event.as_object_mut())
+            .expect("done event")
+            .remove("output_index");
+        let output = replay(&events);
+        let thinking = match block(&output, 0) {
+            AssistantContent::Thinking(thinking) => thinking,
+            other => panic!("expected a thinking block, got {other:?}"),
+        };
+        assert_eq!(
+            thinking
+                .thinking_signature
+                .as_deref()
+                .map(|signature| serde_json::from_str::<Value>(signature).unwrap()),
+            Some(reasoning_item())
+        );
+    }
+
+    /// The capture is what lets the next request replay the turn: the items come back in wire
+    /// order, with the ids and the reasoning blob the provider needs.
+    #[test]
+    fn captured_items_replay_into_the_next_request_in_order() {
+        let mut events = reasoning_events();
+        events.extend([
+            json!({"type": "response.output_item.added", "output_index": 1,
+                   "item": {"type": "message", "id": "msg_fixture", "role": "assistant",
+                            "status": "in_progress", "content": []}}),
+            json!({"type": "response.content_part.added", "output_index": 1, "content_index": 0,
+                   "part": {"type": "output_text", "text": "", "annotations": []}}),
+            json!({"type": "response.output_text.delta", "output_index": 1, "content_index": 0,
+                   "delta": "$0.05"}),
+            json!({"type": "response.output_item.done", "output_index": 1,
+                   "item": {"type": "message", "id": "msg_fixture", "role": "assistant",
+                            "status": "completed", "phase": "final_answer",
+                            "content": [{"type": "output_text", "text": "$0.05"}]}}),
+            json!({"type": "response.output_item.added", "output_index": 2,
+                   "item": function_call_item("")}),
+            json!({"type": "response.output_item.done", "output_index": 2,
+                   "item": function_call_item("{\"cmd\":\"ls\"}")}),
+        ]);
+        let context = Context {
+            system_prompt: Some("You are a helpful assistant.".into()),
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserMessageContent::Text("A bat and a ball cost $1.10".into()),
+                    timestamp: 0,
+                    rest: Map::default(),
+                }),
+                Message::Assistant(replay(&events)),
+            ],
+            tools: None,
+        };
+        let items = convert_responses_messages(
+            &hub_model(),
+            &context,
+            &[],
+            ConvertResponsesMessagesOptions::default(),
+        );
+        // The user turn carries no `type`, the assistant items follow in wire order, and the
+        // unanswered tool call gets the synthetic result that `transform_messages` inserts.
+        let kinds: Vec<Option<&str>> = items
+            .iter()
+            .map(|item| item.get("type").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                None,
+                Some("reasoning"),
+                Some("message"),
+                Some("function_call"),
+                Some("function_call_output")
+            ]
+        );
+        assert_eq!(items[1].get("id"), Some(&json!("rs_fixture")));
+        assert_eq!(items[1].get("encrypted_content"), Some(&json!(ENCRYPTED)));
+        assert_eq!(items[2].get("id"), Some(&json!("msg_fixture")));
+        assert_eq!(items[2].get("phase"), Some(&json!("final_answer")));
+    }
+
+    /// A repeated `done` for an item that is already settled must not emit a second end event.
+    /// This is the fallback shape, which used to leave the slot in the map.
+    #[test]
+    fn a_duplicate_done_emits_no_second_end_event() {
+        let mut events = reasoning_events();
+        let done = events.last_mut().expect("done event");
+        done.as_object_mut()
+            .expect("done object")
+            .remove("output_index");
+        let repeated = events.last().expect("done event").clone();
+        events.push(repeated);
+        let (output, emitted) = replay_with_events(&events);
+        let ends = emitted
+            .iter()
+            .filter(|event| matches!(event, AssistantMessageEvent::ThinkingEnd { .. }))
+            .count();
+        assert_eq!(ends, 1, "{emitted:?}");
+        assert_eq!(output.content.len(), 1);
+        match block(&output, 0) {
+            AssistantContent::Thinking(thinking) => assert_eq!(thinking.thinking, REASONING_TEXT),
+            other => panic!("expected a thinking block, got {other:?}"),
+        }
     }
 }
