@@ -71,12 +71,26 @@ fn replaced_session_env() -> std::sync::RwLockReadGuard<'static, Option<BTreeMap
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// How many times [`replace_session_env`] ran in this process: a kernel
+/// started at an older count must be moved onto the current set.
+static SESSION_ENV_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Make `env`'s session-scoped vars this process's whole session-scoped
 /// set: a var the process env has and `env` lacks reads as unset.
 pub fn replace_session_env(env: &BTreeMap<String, String>) {
-    *REPLACED_SESSION_ENV
+    let mut replaced = REPLACED_SESSION_ENV
         .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session_scoped_env(env));
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *replaced = Some(session_scoped_env(env));
+    SESSION_ENV_VERSION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The count of [`replace_session_env`] calls so far. Read it before the
+/// env it describes: a replacement in between then only causes one more
+/// move onto the same set.
+#[must_use]
+pub fn session_env_version() -> u64 {
+    SESSION_ENV_VERSION.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// One var as this process's session sees it: a session-scoped var from
@@ -150,7 +164,10 @@ mod tests {
         );
         assert_eq!(launch_env.get("PATH"), path.as_ref());
         let overrides = session_env_overrides();
-        assert_eq!(overrides.get("T3_MCP_URL").map(String::as_str), Some("http://t3"));
+        assert_eq!(
+            overrides.get("T3_MCP_URL").map(String::as_str),
+            Some("http://t3")
+        );
         assert!(overrides.keys().all(|key| is_session_scoped(key)));
         assert!(overrides
             .iter()

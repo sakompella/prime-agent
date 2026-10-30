@@ -142,7 +142,10 @@ impl Supervisor {
     /// The resident workers whose durable create names the dead worker as their RLM
     /// parent. The join is the metadata's `parentActiveSessionId` alone: a resumed or
     /// forked copy of the parent's session must never adopt another worker's children.
-    pub(crate) async fn resident_children_of(&self, parent: &Arc<ResidentWorker>) -> Vec<Arc<ResidentWorker>> {
+    pub(crate) async fn resident_children_of(
+        &self,
+        parent: &Arc<ResidentWorker>,
+    ) -> Vec<Arc<ResidentWorker>> {
         let parent_id = {
             let descriptor = parent.descriptor.lock().await;
             descriptor.root_active_session_id.clone()

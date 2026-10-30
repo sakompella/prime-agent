@@ -245,6 +245,11 @@ struct ProvisionerInner {
     options: IpythonKernelProvisionerOptions,
     state: Mutex<ProvisionerState>,
     dispose_signal: AbortSignal,
+    /// The `launch_env::session_env_version` the current kernel's env
+    /// reflects; [`IpythonKernelProvisioner::sync_session_env`] catches up.
+    kernel_session_env_version: std::sync::atomic::AtomicU64,
+    /// One session-env move at a time, so moves land in version order.
+    session_env_move: tokio::sync::Mutex<()>,
 }
 
 impl IpythonKernelProvisioner {
@@ -266,6 +271,8 @@ impl IpythonKernelProvisioner {
                     doomed_startups: Vec::new(),
                 }),
                 dispose_signal: AbortSignal::new(),
+                kernel_session_env_version: std::sync::atomic::AtomicU64::new(0),
+                session_env_move: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -275,6 +282,60 @@ impl IpythonKernelProvisioner {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Move `manager`, this provisioner's kernel, onto the session's T3
+    /// connection when it changed after the kernel's env was taken (see
+    /// `launch_env::replace_session_env`): one internal cell, queued behind a
+    /// running cell and ahead of the caller's. A cell that raises is logged
+    /// and not retried.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cell cannot run (aborted, kernel gone); the
+    /// next call tries again.
+    pub async fn sync_session_env(
+        &self,
+        manager: &ReplKernelManager,
+        signal: Option<AbortSignal>,
+    ) -> anyhow::Result<()> {
+        use pa_types::daemon::launch_env;
+        use std::sync::atomic::Ordering;
+        let behind = || {
+            self.inner.kernel_session_env_version.load(Ordering::SeqCst)
+                < launch_env::session_env_version()
+        };
+        if !behind() {
+            return Ok(());
+        }
+        let _move = self.inner.session_env_move.lock().await;
+        if !behind() {
+            return Ok(());
+        }
+        let version = launch_env::session_env_version();
+        let t3_env = launch_env::session_scoped_env(&launch_env::collect_process_launch_env());
+        let result = manager
+            .execute(
+                &crate::kernel::bootstrap::t3_rebind_code(&t3_env),
+                ExecuteOptions {
+                    internal: true,
+                    signal,
+                    ..ExecuteOptions::default()
+                },
+            )
+            .await?;
+        if let Some(error) = result.error {
+            // Only the exception: a traceback could quote the cell's token.
+            tracing::warn!(
+                "moving the kernel onto the session's T3 connection raised {}: {}",
+                error.ename,
+                error.evalue
+            );
+        }
+        self.inner
+            .kernel_session_env_version
+            .fetch_max(version, Ordering::SeqCst);
+        Ok(())
     }
 
     /// The kernel manager, once a startup has completed successfully.
@@ -1058,16 +1119,16 @@ async fn start_kernel_impl(
     // one source of truth (the registry the daemon registers the notice in).
     // The kernel sees the process env overlaid with the session's own
     // T3 connection, then with `options.env`.
-    let mut env: HashMap<String, String> =
-        pa_types::daemon::launch_env::session_env_overrides()
-            .into_iter()
-            .collect();
+    inner.kernel_session_env_version.store(
+        pa_types::daemon::launch_env::session_env_version(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let mut env: HashMap<String, String> = pa_types::daemon::launch_env::session_env_overrides()
+        .into_iter()
+        .collect();
     env.extend(options.env.clone());
-    let t3_code = crate::T3Code::from_env(|key| {
-        env.get(key)
-            .cloned()
-            .or_else(|| std::env::var(key).ok())
-    });
+    let t3_code =
+        crate::T3Code::from_env(|key| env.get(key).cloned().or_else(|| std::env::var(key).ok()));
     let bootstrap_code = build_rlm_bootstrap_code(
         &options.python_skills,
         options

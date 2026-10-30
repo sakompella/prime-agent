@@ -839,23 +839,6 @@ impl AgentSessionEngine {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Move the built session's running kernel onto another T3 connection;
-    /// `Ok(false)` when no session or kernel runs. Never builds either.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the kernel's rebind cell fails.
-    pub async fn rebind_kernel_t3_env(
-        &self,
-        t3_env: &std::collections::BTreeMap<String, String>,
-    ) -> anyhow::Result<bool> {
-        let engine = self.session.lock().await.clone();
-        match engine {
-            Some(engine) => engine.rebind_kernel_t3_env(t3_env).await,
-            None => Ok(false),
-        }
-    }
-
     /// Session-scoped kernel shell activity; never builds a new session/kernel.
     ///
     /// # Errors

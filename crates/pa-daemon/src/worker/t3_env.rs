@@ -1,7 +1,8 @@
 //! `apply_session_env`: the supervisor hands a live worker the T3
 //! connection of a client that reused it. A worker the daemon started on
-//! its own (a boot or message wake) runs without any; this gives its next
-//! kernel, its later children and its running kernel the client's.
+//! its own (a boot or message wake) runs without any; this gives its
+//! kernel (before its next cell), its later children and later session
+//! builds the client's.
 
 use std::collections::BTreeMap;
 
@@ -37,8 +38,9 @@ fn t3_code_connected_notice() -> Value {
 
 impl Worker {
     /// `apply_session_env { env }`: make `env`'s session-scoped vars this
-    /// worker's own. The running kernel's cell is queued in the background,
-    /// behind any running cell, so the reusing client's open never waits on it.
+    /// worker's own. The running kernel moves onto them before its next
+    /// cell (`IpythonKernelProvisioner::sync_session_env`), so the reusing
+    /// client's open never waits behind a running cell.
     pub(crate) fn handle_apply_session_env(&self, payload: &Value) -> DaemonResponse {
         if let Err(response) = self.require_created("apply_session_env") {
             return response;
@@ -67,13 +69,6 @@ impl Worker {
                 .unwrap()
                 .pending_next_turn
                 .push(t3_code_connected_notice());
-        }
-        if let Some(engine) = self.agent_engine.clone() {
-            tokio::spawn(async move {
-                if let Err(error) = engine.rebind_kernel_t3_env(&env).await {
-                    eprintln!("pa-daemon: the kernel kept its old T3 connection: {error:#}");
-                }
-            });
         }
         response_success(None, "apply_session_env", Some(json!({ "changed": true })))
     }

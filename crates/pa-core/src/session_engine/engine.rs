@@ -1102,42 +1102,6 @@ impl SessionEngine {
             .await
     }
 
-    /// Move this session's running kernel onto another T3 connection (see
-    /// [`crate::kernel::bootstrap::t3_rebind_code`]); `Ok(false)` when no
-    /// kernel runs, since the next one starts on the session's env. The cell
-    /// queues behind a running one and never interrupts it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the cell cannot run or raises.
-    pub async fn rebind_kernel_t3_env(
-        &self,
-        t3_env: &std::collections::BTreeMap<String, String>,
-    ) -> anyhow::Result<bool> {
-        let Some(manager) = self.provisioner.manager().filter(|manager| manager.is_running())
-        else {
-            return Ok(false);
-        };
-        let result = manager
-            .execute(
-                &crate::kernel::bootstrap::t3_rebind_code(t3_env),
-                crate::kernel::shared::ExecuteOptions {
-                    internal: true,
-                    ..crate::kernel::shared::ExecuteOptions::default()
-                },
-            )
-            .await?;
-        match result.error {
-            None => Ok(true),
-            // Only the exception: a traceback could quote the cell's token.
-            Some(error) => Err(anyhow::anyhow!(
-                "the T3 rebind cell raised {}: {}",
-                error.ename,
-                error.evalue
-            )),
-        }
-    }
-
     /// Out-of-band kernel bash activity, scoped to this session's live kernel.
     ///
     /// # Errors
